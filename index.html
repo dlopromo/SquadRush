@@ -1,0 +1,126 @@
+<!doctype html>
+<html lang="zh-Hant">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+    <meta name="theme-color" content="#8ed8ff" />
+    <meta
+      name="description"
+      content="小隊衝衝衝 — 左右移動招募夥伴，壯大隊伍，擊敗城堡巨人。"
+    />
+    <title>小隊衝衝衝</title>
+  </head>
+  <body>
+    <main id="app">
+      <section class="game-shell" aria-label="小隊衝衝衝遊戲">
+        <header class="topbar">
+          <a class="wordmark" href="./" aria-label="返回遊戲首頁">
+            <span class="wordmark-mark" aria-hidden="true"></span>
+            <span>小隊衝衝衝</span>
+          </a>
+          <div class="topbar-actions">
+            <button id="pause-button" class="icon-button" type="button" aria-label="暫停遊戲" title="暫停">
+              <span class="pause-icon" aria-hidden="true"></span>
+            </button>
+            <button id="sound-button" class="icon-button" type="button" aria-label="關閉聲音" title="聲音">
+              <span class="sound-icon" aria-hidden="true"></span>
+            </button>
+          </div>
+        </header>
+
+        <div class="stage-wrap">
+          <canvas id="game-canvas" aria-label="遊戲畫面"></canvas>
+
+          <div id="hud" class="hud is-hidden" aria-live="polite">
+            <div class="hud-block hud-squad">
+              <span class="hud-label">人數</span>
+              <strong id="squad-value">06</strong>
+            </div>
+            <div class="zone-readout">
+              <span id="zone-label">第 1 段 / 青青草原</span>
+              <div class="progress-track"><span id="progress-fill"></span></div>
+            </div>
+            <div class="hud-block hud-score">
+              <span class="hud-label">分數</span>
+              <strong id="score-value">000000</strong>
+            </div>
+          </div>
+
+          <div id="menu-screen" class="screen menu-screen">
+            <div class="menu-grid">
+              <div class="hero-copy">
+                <p class="eyebrow"><span></span> 一起出發吧！</p>
+                <h1>小隊<br /><em>衝衝衝</em></h1>
+                <p class="hero-description">
+                  左右移動招募夥伴，避開陷阱。隊伍愈大，力量愈強！
+                </p>
+                <button id="start-button" class="primary-button" type="button">
+                  <span>開始遊戲</span>
+                  <span class="button-arrow" aria-hidden="true">→</span>
+                </button>
+              </div>
+
+              <aside class="mission-card">
+                <div class="mission-visual" aria-hidden="true">
+                  <div class="radar-ring ring-one"></div>
+                  <div class="radar-ring ring-two"></div>
+                  <div class="core-glyph"><i></i><i></i><i></i></div>
+                  <div class="scan-line"></div>
+                </div>
+                <div class="mission-meta">
+                  <span>第 1 關</span>
+                  <strong>前往巨人城堡</strong>
+                </div>
+                <dl class="mission-stats">
+                  <div><dt>最高紀錄</dt><dd id="best-score">000000</dd></div>
+                  <div><dt>遊戲時間</dt><dd>60 秒</dd></div>
+                </dl>
+              </aside>
+            </div>
+
+            <div class="controls-strip">
+              <p><kbd>A</kbd><kbd>D</kbd> 或 <kbd>←</kbd><kbd>→</kbd> 切換軌道</p>
+              <p><span class="touch-symbol" aria-hidden="true">↔</span> 手機拖曳控制</p>
+            </div>
+          </div>
+
+          <div id="pause-screen" class="screen pause-screen is-hidden">
+            <div class="result-panel compact">
+              <p class="eyebrow"><span></span> 休息一下</p>
+              <h2>遊戲暫停</h2>
+              <p>夥伴們正在等你。準備好就繼續！</p>
+              <button id="resume-button" class="primary-button" type="button">
+                <span>繼續任務</span><span class="button-arrow" aria-hidden="true">→</span>
+              </button>
+            </div>
+          </div>
+
+          <div id="result-screen" class="screen result-screen is-hidden">
+            <div class="result-panel">
+              <p id="result-eyebrow" class="eyebrow"><span></span> 差一點點！</p>
+              <h2 id="result-title">挑戰失敗</h2>
+              <p id="result-message">再多招募一些夥伴，下次一定能打敗巨人！</p>
+              <div class="result-stats">
+                <div><span>本次分數</span><strong id="final-score">000000</strong></div>
+                <div><span>最佳紀錄</span><strong id="final-best">000000</strong></div>
+                <div><span>最多夥伴</span><strong id="max-squad">00</strong></div>
+              </div>
+              <button id="restart-button" class="primary-button" type="button">
+                <span>再玩一次</span><span class="button-arrow" aria-hidden="true">↻</span>
+              </button>
+            </div>
+          </div>
+
+          <div id="toast" class="toast" role="status" aria-live="assertive"></div>
+        </div>
+
+        <footer class="footer">
+          <span>LEVEL 01</span>
+          <span>左右移動，壯大隊伍</span>
+          <span id="status-indicator"><i></i> 準備出發</span>
+        </footer>
+      </section>
+    </main>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
