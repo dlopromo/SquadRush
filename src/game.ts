@@ -3,10 +3,14 @@ import {
   WEAPONS,
   applyAutomaticUpgrades,
   applyGate,
+  carrySquadForNextStage,
   clamp,
+  crowdPower,
+  encounterHealth,
   formatCount,
   formatScore,
   getStageDefinition,
+  visibleVolleyCount,
   type GameSave,
   type GateChoice,
   type StageDefinition,
@@ -28,6 +32,9 @@ type Target = {
   radius: number;
   dead: boolean;
   phase: number;
+  hitFlash: number;
+  recoil: number;
+  lastHealthRatio: number;
 };
 
 type GatePair = {
@@ -55,6 +62,7 @@ type Projectile = {
   splash: number;
   color: string;
   life: number;
+  radius: number;
 };
 
 type Particle = {
@@ -76,6 +84,16 @@ type CoinFx = {
   life: number;
   delay: number;
 };
+
+type DamageText = {
+  x: number;
+  y: number;
+  value: number;
+  life: number;
+  color: string;
+};
+
+type PendingBonus = Extract<StageSegment, { type: "gates" | "weapon" }>;
 
 export type HudData = {
   squad: number;
@@ -113,6 +131,8 @@ const PLAYER_Y = 0.87;
 const TRAVEL_SPEED = 0.055;
 const TARGET_SPEED = 0.18;
 const SEGMENT_LOOKAHEAD = 0.17;
+const BACKGROUND_SPEED = 112;
+const BONUS_CLEARANCE = 80;
 const WEAPON_LABELS: Record<WeaponType, string> = {
   blaster: "BLASTER",
   machineGun: "MINIGUN",
@@ -150,11 +170,13 @@ export class SquadRushGame {
   private projectiles: Projectile[] = [];
   private particles: Particle[] = [];
   private coinFx: CoinFx[] = [];
+  private damageTexts: DamageText[] = [];
+  private pendingBonuses: PendingBonus[] = [];
   private spawnedSegments = new Set<number>();
   private nextId = 1;
   private fireTimer = 0;
   private lastTime = 0;
-  private roadOffset = 0;
+  private backgroundOffset = 0;
   private shake = 0;
   private flash = 0;
   private bossActive = false;
@@ -242,9 +264,11 @@ export class SquadRushGame {
     this.projectiles = [];
     this.particles = [];
     this.coinFx = [];
+    this.damageTexts = [];
+    this.pendingBonuses = [];
     this.spawnedSegments.clear();
     this.fireTimer = 0;
-    this.roadOffset = 0;
+    this.backgroundOffset = 0;
     this.shake = 0;
     this.flash = 0;
     this.bossActive = false;
@@ -323,7 +347,7 @@ export class SquadRushGame {
     const direction = Number(this.rightHeld) - Number(this.leftHeld);
     if (direction !== 0) this.targetX = clamp(this.targetX + direction * delta * 0.54, ROAD_MIN_X, ROAD_MAX_X);
     this.playerX += (this.targetX - this.playerX) * Math.min(1, delta * 11);
-    this.roadOffset = (this.roadOffset + delta * 260) % 105;
+    this.backgroundOffset += delta * BACKGROUND_SPEED;
     this.shake = Math.max(0, this.shake - delta * 3.4);
     this.flash = Math.max(0, this.flash - delta * 3.5);
     this.messageLife = Math.max(0, this.messageLife - delta);
@@ -335,7 +359,13 @@ export class SquadRushGame {
     if (!this.bossActive) {
       this.progress = Math.min(1, this.progress + (TRAVEL_SPEED / this.stage.length) * 22 * delta);
       this.spawnSegments();
-      if (this.progress >= 0.985 && this.targets.length === 0 && this.gates.length === 0 && this.weaponGates.length === 0) {
+      if (
+        this.progress >= 0.985
+        && this.targets.length === 0
+        && this.gates.length === 0
+        && this.weaponGates.length === 0
+        && this.pendingBonuses.length === 0
+      ) {
         this.spawnBoss();
       }
     }
@@ -345,6 +375,7 @@ export class SquadRushGame {
     this.updateProjectiles(delta);
     this.updateParticles(delta);
     this.updateCoinFx(delta);
+    this.updateDamageTexts(delta);
 
     this.score += delta * (12 + this.combo * 1.8);
     this.maxSquad = Math.max(this.maxSquad, this.squad);
@@ -356,9 +387,18 @@ export class SquadRushGame {
       if (this.spawnedSegments.has(index)) return;
       if (segment.at <= this.progress + SEGMENT_LOOKAHEAD) {
         this.spawnedSegments.add(index);
-        this.spawnSegment(segment);
+        if (segment.type === "gates" || segment.type === "weapon") this.pendingBonuses.push(segment);
+        else this.spawnSegment(segment);
       }
     });
+    if (this.pendingBonuses.length > 0 && !this.hasVisibleBonus()) {
+      this.spawnSegment(this.pendingBonuses.shift()!);
+    }
+  }
+
+  private hasVisibleBonus(): boolean {
+    return this.gates.some((gate) => !gate.passed && gate.y > -this.height - BONUS_CLEARANCE)
+      || this.weaponGates.some((gate) => !gate.passed && gate.y > -this.height - BONUS_CLEARANCE);
   }
 
   private spawnSegment(segment: StageSegment): void {
@@ -371,20 +411,25 @@ export class SquadRushGame {
       return;
     }
     if (segment.type === "tires") {
+      const health = encounterHealth(this.squad, this.weapon, this.save.upgrades, 2.1);
       this.targets.push({
         id: this.nextId++,
         kind: "tires",
         x: segment.x,
         y: -70,
-        health: segment.health,
-        maxHealth: segment.health,
+        health,
+        maxHealth: health,
         radius: 34,
         dead: false,
         phase: 0,
+        hitFlash: 0,
+        recoil: 0,
+        lastHealthRatio: 1,
       });
       return;
     }
-    const columns = Math.max(1, Math.min(3, Math.ceil(segment.count / 4)));
+    const columns = Math.max(3, Math.min(6, Math.ceil(Math.sqrt(segment.count * 0.8))));
+    const health = encounterHealth(this.squad, this.weapon, this.save.upgrades, 2.2, segment.count);
     for (let index = 0; index < segment.count; index += 1) {
       const column = index % columns;
       const row = Math.floor(index / columns);
@@ -394,11 +439,14 @@ export class SquadRushGame {
         kind: "enemy",
         x,
         y: -45 - row * 44,
-        health: segment.health,
-        maxHealth: segment.health,
+        health,
+        maxHealth: health,
         radius: 15,
         dead: false,
         phase: index * 0.7,
+        hitFlash: 0,
+        recoil: 0,
+        lastHealthRatio: 1,
       });
     }
   }
@@ -406,16 +454,25 @@ export class SquadRushGame {
   private spawnBoss(): void {
     this.bossActive = true;
     this.audio.boss();
+    const health = encounterHealth(
+      this.squad,
+      this.weapon,
+      this.save.upgrades,
+      Math.max(6, 8.5 - this.save.failures * 0.55),
+    );
     this.boss = {
       id: this.nextId++,
       kind: "boss",
       x: 0.5,
       y: this.height * 0.19,
-      health: this.stage.bossHealth,
-      maxHealth: this.stage.bossHealth,
+      health,
+      maxHealth: health,
       radius: 62,
       dead: false,
       phase: 0,
+      hitFlash: 0,
+      recoil: 0,
+      lastHealthRatio: 1,
     };
     this.targets.push(this.boss);
     this.showMessage("BOSS!", "bad", 1.2);
@@ -450,7 +507,10 @@ export class SquadRushGame {
     this.weaponGates = this.weaponGates.filter((gate) => gate.y < this.height + 100 && !gate.passed);
 
     this.targets.forEach((target) => {
-      if (target.dead || target.kind === "boss") return;
+      if (target.dead) return;
+      target.hitFlash = Math.max(0, target.hitFlash - delta * 9);
+      target.recoil = Math.max(0, target.recoil - delta * 8);
+      if (target.kind === "boss") return;
       target.y += speed * delta;
       target.phase += delta;
       if (target.y >= this.height * 0.83) this.collideTarget(target);
@@ -465,34 +525,44 @@ export class SquadRushGame {
     const stats = WEAPONS[this.weapon];
     const rateMultiplier = 1 + this.save.upgrades.fireRate * 0.08;
     this.fireTimer = stats.interval / rateMultiplier;
-    const shots = Math.min(stats.pellets, this.weapon === "shotgun" ? 5 : 1);
-    const originX = this.px(this.playerX);
-    const originY = this.height * (PLAYER_Y - 0.05);
+    const shots = visibleVolleyCount(this.squad, this.weapon);
+    const liveTargets = this.findTargets();
+    const totalDamage = stats.damage
+      * stats.pellets
+      * (1 + this.save.upgrades.damage * 0.12)
+      * crowdPower(this.squad);
+    const damagePerShot = totalDamage / shots;
     for (let index = 0; index < shots; index += 1) {
-      const spread = shots === 1 ? 0 : (index - (shots - 1) / 2) * 0.085;
-      const targetX = this.px(target.x + spread);
-      const targetY = target.y;
+      const shooter = this.crowdPosition(index, shots);
+      const assignedTarget = liveTargets[index % Math.min(liveTargets.length, Math.max(1, Math.ceil(shots / 5)))] ?? target;
+      const pelletSpread = this.weapon === "shotgun" ? ((index % 5) - 2) * 0.018 : 0;
+      const targetX = this.px(assignedTarget.x + pelletSpread);
+      const targetY = assignedTarget.y;
+      const originX = shooter.x;
+      const originY = shooter.y - 12;
       const angle = Math.atan2(targetY - originY, targetX - originX);
-      const crowdPower = Math.max(1, Math.sqrt(this.squad) * 1.38 + Math.log10(this.squad + 1) * 0.9);
-      const damage = stats.damage * (1 + this.save.upgrades.damage * 0.12) * crowdPower;
       this.projectiles.push({
         x: originX,
         y: originY,
         vx: Math.cos(angle) * 760,
         vy: Math.sin(angle) * 760,
-        damage,
+        damage: damagePerShot,
         splash: stats.splash,
         color: this.weapon === "rocket" ? "#ff8a3d" : this.weapon === "shotgun" ? "#ffe277" : "#fff4a9",
         life: 1.2,
+        radius: this.weapon === "rocket" ? 7 : 3,
       });
     }
     this.audio.shoot(this.weapon);
   }
 
   private findTarget(): Target | null {
+    return this.findTargets()[0] ?? null;
+  }
+
+  private findTargets(): Target[] {
     const live = this.targets.filter((target) => !target.dead && target.y < this.height * 0.82);
-    if (live.length === 0) return null;
-    return live.sort((a, b) => b.y - a.y || Math.abs(a.x - this.playerX) - Math.abs(b.x - this.playerX))[0];
+    return live.sort((a, b) => b.y - a.y || Math.abs(a.x - this.playerX) - Math.abs(b.x - this.playerX));
   }
 
   private updateProjectiles(delta: number): void {
@@ -516,7 +586,16 @@ export class SquadRushGame {
 
   private damageTarget(target: Target, damage: number, splash: number): void {
     target.health -= damage;
-    this.burst(this.px(target.x), target.y, target.kind === "tires" ? "#555555" : "#ff665c", 3);
+    target.hitFlash = 1;
+    target.recoil = Math.min(1, target.recoil + 0.55);
+    this.damageTexts.push({
+      x: this.px(target.x) + (Math.random() - 0.5) * 18,
+      y: target.y - target.radius,
+      value: damage,
+      life: 0.58,
+      color: target.kind === "boss" ? "#ffe063" : "#ffffff",
+    });
+    this.burst(this.px(target.x), target.y, target.kind === "tires" ? "#555555" : "#ff665c", target.kind === "boss" ? 7 : 5);
     const splashDeaths: Target[] = [];
     if (splash > 0) {
       this.targets.forEach((other) => {
@@ -529,6 +608,13 @@ export class SquadRushGame {
         }
       });
     }
+    const healthRatio = Math.max(0, target.health / target.maxHealth);
+    if (target.kind === "boss" && Math.floor(target.lastHealthRatio * 4) > Math.floor(healthRatio * 4)) {
+      this.shake = Math.max(this.shake, 0.42);
+      this.rushPulse = 0.75;
+      this.burst(this.px(target.x), target.y, "#ffd45c", 34);
+    }
+    target.lastHealthRatio = healthRatio;
     if (target.health <= 0) this.killTarget(target);
     splashDeaths.forEach((other) => this.killTarget(other));
   }
@@ -540,6 +626,7 @@ export class SquadRushGame {
     this.combo += 1;
     this.comboTimer = 2.6;
     this.rushPulse = Math.min(1, this.rushPulse + 0.18);
+    this.shake = Math.max(this.shake, target.kind === "boss" ? 1 : target.kind === "tires" ? 0.38 : 0.16);
     this.score += reward * 50 * Math.max(1, this.combo);
     this.audio.hit();
     this.burst(
@@ -572,7 +659,7 @@ export class SquadRushGame {
     if (this.state !== "playing") return;
     this.audio.win();
     this.save.coins += this.stageCoins;
-    this.save.carrySquad = Math.max(this.save.carrySquad, Math.floor(this.squad * 1.12));
+    this.save.carrySquad = carrySquadForNextStage(this.squad, this.stage.stage + 1, this.save.upgrades);
     this.save.currentStage = this.stage.stage + 1;
     this.save.highestStage = Math.max(this.save.highestStage, this.save.currentStage);
     this.save.bestScore = Math.max(this.save.bestScore, Math.floor(this.score));
@@ -629,6 +716,14 @@ export class SquadRushGame {
     this.particles = this.particles.filter((particle) => particle.life > 0);
   }
 
+  private updateDamageTexts(delta: number): void {
+    this.damageTexts.forEach((text) => {
+      text.y -= 34 * delta;
+      text.life -= delta;
+    });
+    this.damageTexts = this.damageTexts.filter((text) => text.life > 0);
+  }
+
   private pushHud(): void {
     this.callbacks.onHudUpdate({
       squad: this.squad,
@@ -668,6 +763,7 @@ export class SquadRushGame {
     this.drawProjectiles(context);
     if (this.state !== "menu") this.drawCrowd(context, time);
     this.drawParticles(context);
+    this.drawDamageTexts(context);
     this.drawCoinFx(context);
     if (this.messageLife > 0) this.drawCenterMessage(context);
     if (this.rushPulse > 0) this.drawRushPulse(context);
@@ -687,12 +783,10 @@ export class SquadRushGame {
     context.fillStyle = "#65dc58";
     context.fillRect(0, this.height * 0.27, this.width, this.height * 0.73);
 
-    this.drawTrees(context, time);
-
-    const leftTop = this.width * 0.32;
-    const rightTop = this.width * 0.68;
-    const leftBottom = this.width * 0.035;
-    const rightBottom = this.width * 0.965;
+    const leftTop = this.width * 0.23;
+    const rightTop = this.width * 0.77;
+    const leftBottom = this.width * 0.08;
+    const rightBottom = this.width * 0.92;
     context.fillStyle = "#bfc4ca";
     context.beginPath();
     context.moveTo(leftTop, 0);
@@ -701,6 +795,9 @@ export class SquadRushGame {
     context.lineTo(leftBottom, this.height);
     context.closePath();
     context.fill();
+
+    this.drawRoadTexture(context);
+    this.drawTrees(context, time);
 
     context.strokeStyle = "#ffffff";
     context.lineWidth = Math.max(3, this.width * 0.008);
@@ -714,8 +811,8 @@ export class SquadRushGame {
     context.save();
     context.strokeStyle = "rgba(255,255,255,0.94)";
     context.lineWidth = Math.max(3, this.width * 0.009);
-    context.setLineDash([32, 36]);
-    context.lineDashOffset = this.roadOffset;
+    context.setLineDash([34, 38]);
+    context.lineDashOffset = this.backgroundOffset;
     context.beginPath();
     context.moveTo(this.width / 2, -20);
     context.lineTo(this.width / 2, this.height + 20);
@@ -735,29 +832,49 @@ export class SquadRushGame {
   }
 
   private drawTrees(context: CanvasRenderingContext2D, time: number): void {
-    for (let index = 0; index < 14; index += 1) {
-      const side = index % 2 === 0 ? -1 : 1;
-      const row = Math.floor(index / 2);
-      const y = ((row * 145 + this.roadOffset * 1.4) % (this.height + 180)) - 60;
-      const perspective = clamp(y / this.height, 0.15, 1);
-      const roadEdge = side < 0
-        ? this.width * (0.32 - 0.285 * perspective)
-        : this.width * (0.68 + 0.285 * perspective);
-      const x = roadEdge + side * (25 + (row % 3) * 18);
-      const scale = 0.35 + perspective * 0.75;
-      context.save();
-      context.translate(x, y + Math.sin(time + index) * 1.2);
-      context.scale(scale, scale);
-      context.fillStyle = "#75503a";
-      context.fillRect(-5, 2, 10, 34);
-      context.fillStyle = index % 3 === 0 ? "#2e9d3d" : "#42b84c";
-      context.beginPath();
-      context.arc(-9, -8, 20, 0, Math.PI * 2);
-      context.arc(9, -17, 24, 0, Math.PI * 2);
-      context.arc(20, 1, 18, 0, Math.PI * 2);
-      context.fill();
-      context.restore();
+    const spacing = 132;
+    const firstRow = Math.floor(-this.backgroundOffset / spacing) - 1;
+    const visibleRows = Math.ceil(this.height / spacing) + 3;
+    for (let rowOffset = 0; rowOffset < visibleRows; rowOffset += 1) {
+      const worldRow = firstRow + rowOffset;
+      const y = worldRow * spacing + this.backgroundOffset + spacing;
+      for (const side of [-1, 1]) {
+        const roadEdge = side < 0 ? this.roadXAt(0, y) : this.roadXAt(1, y);
+        const stagger = (Math.abs(worldRow) % 3) * 9;
+        const x = roadEdge + side * (34 + stagger);
+        context.save();
+        context.translate(x, y + Math.sin(time * 1.5 + worldRow) * 0.5);
+        context.fillStyle = "#76513a";
+        context.fillRect(-4, 3, 8, 30);
+        context.fillStyle = Math.abs(worldRow) % 3 === 0 ? "#2f9b3d" : "#43b84c";
+        context.beginPath();
+        context.arc(-8, -7, 17, 0, Math.PI * 2);
+        context.arc(7, -14, 20, 0, Math.PI * 2);
+        context.arc(16, 1, 15, 0, Math.PI * 2);
+        context.fill();
+        context.restore();
+      }
     }
+  }
+
+  private drawRoadTexture(context: CanvasRenderingContext2D): void {
+    const spacing = 86;
+    const firstLine = Math.floor(-this.backgroundOffset / spacing) - 1;
+    const visibleLines = Math.ceil(this.height / spacing) + 3;
+    context.save();
+    context.strokeStyle = "rgba(130, 137, 143, 0.22)";
+    context.lineWidth = 2;
+    for (let index = 0; index < visibleLines; index += 1) {
+      const worldLine = firstLine + index;
+      const y = worldLine * spacing + this.backgroundOffset + spacing;
+      const left = this.roadXAt(0, y);
+      const right = this.roadXAt(1, y);
+      context.beginPath();
+      context.moveTo(left, y);
+      context.lineTo(right, y);
+      context.stroke();
+    }
+    context.restore();
   }
 
   private drawGates(context: CanvasRenderingContext2D): void {
@@ -832,17 +949,23 @@ export class SquadRushGame {
     const x = this.px(target.x);
     if (target.kind === "enemy") {
       const scale = 0.55 + clamp(target.y / this.height, 0, 1) * 0.75;
-      this.drawPerson(context, x, target.y + Math.sin(time * 7 + target.phase) * 2, "#e64f50", scale);
+      this.drawPerson(
+        context,
+        x,
+        target.y - target.recoil * 8 + Math.sin(time * 7 + target.phase) * 2,
+        target.hitFlash > 0 ? "#ffffff" : "#e64f50",
+        scale * (1 + target.recoil * 0.08),
+      );
       this.drawHealthBadge(context, x, target.y - 28 * scale, target.health, target.maxHealth, scale);
       return;
     }
     if (target.kind === "tires") {
       const scale = 0.55 + clamp(target.y / this.height, 0, 1) * 0.7;
       context.save();
-      context.translate(x, target.y);
-      context.scale(scale, scale);
+      context.translate(x, target.y - target.recoil * 7);
+      context.scale(scale * (1 + target.recoil * 0.06), scale * (1 - target.recoil * 0.05));
       for (let index = 0; index < 3; index += 1) {
-        context.fillStyle = "#202326";
+        context.fillStyle = target.hitFlash > 0 ? "#f4f4f4" : "#202326";
         context.beginPath();
         context.ellipse(0, 18 - index * 17, 36, 15, 0, 0, Math.PI * 2);
         context.fill();
@@ -860,16 +983,16 @@ export class SquadRushGame {
 
   private drawBoss(context: CanvasRenderingContext2D, boss: Target, time: number): void {
     const x = this.px(boss.x);
-    const y = boss.y + Math.sin(time * 2.3) * 3;
+    const y = boss.y - boss.recoil * 10 + Math.sin(time * 2.3) * 3;
     const scale = Math.min(1.35, 0.95 + this.stage.stage * 0.015);
     context.save();
     context.translate(x, y);
-    context.scale(scale, scale);
+    context.scale(scale * (1 + boss.recoil * 0.08), scale * (1 - boss.recoil * 0.05));
     context.fillStyle = "rgba(36,29,48,0.2)";
     context.beginPath();
     context.ellipse(0, 54, 48, 13, 0, 0, Math.PI * 2);
     context.fill();
-    context.fillStyle = "#803ec1";
+    context.fillStyle = boss.hitFlash > 0 ? "#ffffff" : "#803ec1";
     context.beginPath();
     context.roundRect(-37, -26, 74, 86, 24);
     context.fill();
@@ -986,7 +1109,7 @@ export class SquadRushGame {
   private drawProjectiles(context: CanvasRenderingContext2D): void {
     this.projectiles.forEach((projectile) => {
       context.strokeStyle = projectile.color;
-      context.lineWidth = projectile.splash > 0 ? 6 : 3;
+      context.lineWidth = projectile.radius;
       context.shadowColor = projectile.color;
       context.shadowBlur = 8;
       context.beginPath();
@@ -1004,6 +1127,23 @@ export class SquadRushGame {
       context.fillRect(particle.x, particle.y, particle.size, particle.size);
     });
     context.globalAlpha = 1;
+  }
+
+  private drawDamageTexts(context: CanvasRenderingContext2D): void {
+    context.save();
+    context.textAlign = "center";
+    context.textBaseline = "middle";
+    context.font = "900 14px 'Arial Rounded MT Bold', sans-serif";
+    this.damageTexts.forEach((text) => {
+      context.globalAlpha = clamp(text.life / 0.35, 0, 1);
+      context.fillStyle = text.color;
+      context.strokeStyle = "rgba(33, 39, 45, 0.65)";
+      context.lineWidth = 3;
+      const label = Math.max(1, Math.round(text.value)).toString();
+      context.strokeText(label, text.x, text.y);
+      context.fillText(label, text.x, text.y);
+    });
+    context.restore();
   }
 
   private spawnCoins(x: number, y: number, count: number): void {
@@ -1093,14 +1233,28 @@ export class SquadRushGame {
     }
   }
 
+  private crowdPosition(index: number, count: number): { x: number; y: number } {
+    const centerX = this.px(this.playerX);
+    const baseY = this.height * (PLAYER_Y - 0.045);
+    const columns = Math.min(10, Math.max(1, Math.ceil(Math.sqrt(count * 1.55))));
+    const row = Math.floor(index / columns);
+    const rowCount = Math.min(columns, count - row * columns);
+    const column = index % columns;
+    const spread = Math.min(this.width * 0.31, 20 * rowCount);
+    return {
+      x: centerX + (rowCount === 1 ? 0 : (column / (rowCount - 1) - 0.5) * spread),
+      y: baseY + row * 13,
+    };
+  }
+
   private px(normalizedX: number): number {
     return this.roadXAt(normalizedX, this.height * PLAYER_Y);
   }
 
   private roadXAt(normalizedX: number, y: number): number {
     const perspective = clamp(y / this.height, 0, 1);
-    const left = this.width * (0.32 - 0.285 * perspective);
-    const right = this.width * (0.68 + 0.285 * perspective);
+    const left = this.width * (0.23 - 0.15 * perspective);
+    const right = this.width * (0.77 + 0.15 * perspective);
     return left + (right - left) * normalizedX;
   }
 

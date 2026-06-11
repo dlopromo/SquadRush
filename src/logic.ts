@@ -57,13 +57,13 @@ export const WEAPONS: Record<WeaponType, { damage: number; interval: number; pel
 };
 
 const FIXED_GATES: Array<Array<[GateChoice, GateChoice]>> = [
-  [[{ operation: "add", value: 9 }, { operation: "subtract", value: 2 }], [{ operation: "multiply", value: 2 }, { operation: "add", value: 7 }], [{ operation: "add", value: 12 }, { operation: "add", value: 5 }]],
-  [[{ operation: "add", value: 12 }, { operation: "subtract", value: 12 }], [{ operation: "add", value: 27 }, { operation: "add", value: 38 }], [{ operation: "multiply", value: 2 }, { operation: "add", value: 20 }]],
-  [[{ operation: "add", value: 39 }, { operation: "multiply", value: 2 }], [{ operation: "add", value: 53 }, { operation: "add", value: 61 }], [{ operation: "multiply", value: 2 }, { operation: "add", value: 47 }]],
-  [[{ operation: "add", value: 103 }, { operation: "add", value: 228 }], [{ operation: "add", value: 304 }, { operation: "add", value: 659 }], [{ operation: "multiply", value: 2 }, { operation: "add", value: 410 }]],
-  [[{ operation: "add", value: 102 }, { operation: "add", value: 38 }], [{ operation: "add", value: 233 }, { operation: "add", value: 668 }], [{ operation: "multiply", value: 2 }, { operation: "add", value: 1200 }]],
-  [[{ operation: "add", value: 11719 }, { operation: "add", value: 11895 }], [{ operation: "add", value: 8084 }, { operation: "add", value: 6104 }], [{ operation: "multiply", value: 2 }, { operation: "add", value: 19219 }]],
-  [[{ operation: "add", value: 6130 }, { operation: "add", value: 1417 }], [{ operation: "add", value: 8084 }, { operation: "add", value: 6104 }], [{ operation: "add", value: 2689 }, { operation: "multiply", value: 2 }]],
+  [[{ operation: "add", value: 3 }, { operation: "subtract", value: 1 }], [{ operation: "add", value: 5 }, { operation: "add", value: 2 }], [{ operation: "add", value: 6 }, { operation: "add", value: 3 }]],
+  [[{ operation: "add", value: 5 }, { operation: "subtract", value: 2 }], [{ operation: "add", value: 8 }, { operation: "add", value: 4 }], [{ operation: "multiply", value: 2 }, { operation: "add", value: 7 }]],
+  [[{ operation: "add", value: 7 }, { operation: "add", value: 4 }], [{ operation: "multiply", value: 2 }, { operation: "add", value: 9 }], [{ operation: "add", value: 11 }, { operation: "subtract", value: 3 }]],
+  [[{ operation: "add", value: 10 }, { operation: "add", value: 6 }], [{ operation: "add", value: 13 }, { operation: "subtract", value: 4 }], [{ operation: "multiply", value: 2 }, { operation: "add", value: 12 }]],
+  [[{ operation: "add", value: 13 }, { operation: "subtract", value: 5 }], [{ operation: "multiply", value: 2 }, { operation: "add", value: 15 }], [{ operation: "add", value: 18 }, { operation: "add", value: 10 }]],
+  [[{ operation: "add", value: 17 }, { operation: "add", value: 10 }], [{ operation: "add", value: 21 }, { operation: "subtract", value: 7 }], [{ operation: "multiply", value: 2 }, { operation: "add", value: 20 }]],
+  [[{ operation: "add", value: 22 }, { operation: "subtract", value: 8 }], [{ operation: "multiply", value: 2 }, { operation: "add", value: 25 }], [{ operation: "add", value: 29 }, { operation: "add", value: 16 }]],
 ];
 
 export function clamp(value: number, min: number, max: number): number {
@@ -94,9 +94,40 @@ export function weaponDps(weapon: WeaponType, upgrades: UpgradeLevels): number {
   return (stats.damage * stats.pellets * damageMultiplier * rateMultiplier) / stats.interval;
 }
 
+export function crowdPower(squad: number): number {
+  const safeSquad = Math.max(1, squad);
+  return Math.max(1, Math.sqrt(safeSquad) * 1.38 + Math.log10(safeSquad + 1) * 0.9);
+}
+
+export function squadDps(squad: number, weapon: WeaponType, upgrades: UpgradeLevels): number {
+  return crowdPower(squad) * weaponDps(weapon, upgrades);
+}
+
+export function visibleVolleyCount(squad: number, weapon: WeaponType): number {
+  const weaponFactor = weapon === "rocket" ? 0.45 : weapon === "shotgun" ? 0.72 : 1;
+  return Math.min(50, Math.max(1, Math.round((2 + Math.sqrt(Math.max(1, squad)) * 2.35) * weaponFactor)));
+}
+
+export function encounterHealth(
+  squad: number,
+  weapon: WeaponType,
+  upgrades: UpgradeLevels,
+  secondsToDefeat: number,
+  count = 1,
+): number {
+  return Math.max(1, Math.round((squadDps(squad, weapon, upgrades) * secondsToDefeat) / Math.max(1, count)));
+}
+
+export function carrySquadForNextStage(squad: number, nextStage: number, upgrades: UpgradeLevels): number {
+  const baseline = 5 + upgrades.squad * 3 + Math.max(0, nextStage - 1) * 5;
+  const cap = Math.round(baseline * (2.6 + Math.min(1.4, nextStage * 0.08)));
+  return Math.min(Math.max(baseline, Math.floor(squad * 0.72)), cap);
+}
+
 export function startingSquad(stage: number, upgrades: UpgradeLevels, carrySquad = 0): number {
-  const stageCarry = stage <= 7 ? Math.floor((stage - 1) ** 2 * 7) : Math.floor(260 * 1.5 ** (stage - 8));
-  return Math.max(5 + upgrades.squad * 3 + stageCarry, Math.floor(carrySquad));
+  const baseline = 5 + upgrades.squad * 3 + Math.max(0, stage - 1) * 5;
+  const carryCap = Math.round(baseline * (2.6 + Math.min(1.4, stage * 0.08)));
+  return Math.max(baseline, Math.min(Math.floor(carrySquad), carryCap));
 }
 
 export function bossHealthFor(stage: number, failures = 0): number {
@@ -145,24 +176,27 @@ function fixedStage(stage: number, failures: number, upgrades: UpgradeLevels, ca
   const gates = FIXED_GATES[stage - 1];
   const strength = 1 + (stage - 1) * 0.38;
   const segments: StageSegment[] = [
-    { type: "gates", at: 0.12, left: gates[0][0], right: gates[0][1] },
-    { type: "enemies", at: 0.24, count: 4 + stage, health: Math.max(1, Math.floor(2 * strength)), spread: 0.32 },
-    { type: "tires", at: 0.34, health: Math.floor(16 * strength), x: stage % 2 ? 0.67 : 0.33 },
-    { type: "gates", at: 0.44, left: gates[1][0], right: gates[1][1] },
-    { type: "enemies", at: 0.56, count: 6 + stage, health: Math.max(1, Math.floor(2.6 * strength)), spread: 0.45 },
+    { type: "gates", at: 0.08, left: gates[0][0], right: gates[0][1] },
+    { type: "enemies", at: 0.16, count: 10 + stage * 2, health: Math.max(1, Math.floor(2 * strength)), spread: 0.42 },
+    { type: "tires", at: 0.24, health: Math.floor(16 * strength), x: stage % 2 ? 0.67 : 0.33 },
+    { type: "enemies", at: 0.31, count: 12 + stage * 2, health: Math.max(1, Math.floor(2.3 * strength)), spread: 0.46 },
+    { type: "gates", at: 0.39, left: gates[1][0], right: gates[1][1] },
+    { type: "enemies", at: 0.47, count: 14 + stage * 2, health: Math.max(1, Math.floor(2.6 * strength)), spread: 0.52 },
     {
       type: "weapon",
-      at: 0.65,
+      at: 0.57,
       left: stage % 3 === 0 ? "rocket" : "machineGun",
       right: stage % 2 === 0 ? "shotgun" : "rocket",
     },
-    { type: "tires", at: 0.74, health: Math.floor(24 * strength), x: stage % 2 ? 0.32 : 0.68 },
-    { type: "gates", at: 0.82, left: gates[2][0], right: gates[2][1] },
-    { type: "enemies", at: 0.9, count: 8 + stage, health: Math.max(1, Math.floor(3 * strength)), spread: 0.4 },
+    { type: "enemies", at: 0.64, count: 16 + stage * 2, health: Math.max(1, Math.floor(2.8 * strength)), spread: 0.5 },
+    { type: "tires", at: 0.71, health: Math.floor(24 * strength), x: stage % 2 ? 0.32 : 0.68 },
+    { type: "enemies", at: 0.77, count: 15 + stage * 2, health: Math.max(1, Math.floor(2.8 * strength)), spread: 0.48 },
+    { type: "gates", at: 0.84, left: gates[2][0], right: gates[2][1] },
+    { type: "enemies", at: 0.91, count: 18 + stage * 2, health: Math.max(1, Math.floor(3 * strength)), spread: 0.5 },
   ];
   return {
     stage,
-    length: 22 + stage * 0.7,
+    length: 18 + stage * 0.55,
     startSquad: startingSquad(stage, upgrades, carrySquad),
     bossHealth: bossHealthFor(stage, failures),
     segments,
@@ -181,18 +215,22 @@ function endlessStage(
   const tier = stage - 7;
   const start = startingSquad(stage, upgrades, carrySquad);
   const segments: StageSegment[] = [];
-  const slots = 10 + Math.min(5, Math.floor(tier / 3));
+  const slots = 14 + Math.min(6, Math.floor(tier / 3));
+  let multiplierUsed = false;
   for (let index = 0; index < slots; index += 1) {
-    const at = 0.08 + index * (0.82 / slots);
+    const at = 0.055 + index * (0.89 / slots);
     const roll = random();
     if (index % 4 === 0) {
-      const gain = Math.max(12, Math.floor(start * (0.18 + random() * 0.28)));
-      const strong: GateChoice = random() > 0.62
-        ? { operation: "multiply", value: random() > 0.78 ? 3 : 2 }
+      const levelBaseline = start + index * Math.max(3, Math.round(start * 0.09));
+      const gain = Math.max(4, Math.floor(levelBaseline * (0.08 + random() * 0.1)));
+      const useMultiplier: boolean = multiplierUsed === false && index >= 4 && random() > 0.72;
+      const strong: GateChoice = useMultiplier
+        ? { operation: "multiply", value: 2 }
         : { operation: "add", value: gain };
+      if (useMultiplier) multiplierUsed = true;
       const gentle: GateChoice = random() > 0.75
-        ? { operation: "subtract", value: Math.max(1, Math.floor(gain * 0.25)) }
-        : { operation: "add", value: Math.max(4, Math.floor(gain * 0.55)) };
+        ? { operation: "subtract", value: Math.max(1, Math.floor(levelBaseline * (0.04 + random() * 0.04))) }
+        : { operation: "add", value: Math.max(3, Math.floor(gain * 0.58)) };
       segments.push(random() > 0.5
         ? { type: "gates", at, left: strong, right: gentle }
         : { type: "gates", at, left: gentle, right: strong });
@@ -200,7 +238,7 @@ function endlessStage(
       segments.push({
         type: "enemies",
         at,
-        count: 5 + Math.floor(random() * 8),
+        count: Math.min(42, 16 + Math.floor(tier * 0.75) + Math.floor(random() * 10)),
         health: Math.floor((2.5 + tier * 0.4) * (0.75 + random() * 0.3)),
         spread: 0.25 + random() * 0.35,
       });
@@ -213,17 +251,19 @@ function endlessStage(
       });
     } else {
       const options: WeaponType[] = ["machineGun", "shotgun", "rocket"];
+      const leftIndex = Math.floor(random() * options.length);
+      const rightOffset = 1 + Math.floor(random() * (options.length - 1));
       segments.push({
         type: "weapon",
         at,
-        left: options[Math.floor(random() * options.length)],
-        right: options[Math.floor(random() * options.length)],
+        left: options[leftIndex],
+        right: options[(leftIndex + rightOffset) % options.length],
       });
     }
   }
   return {
     stage,
-    length: 27 + Math.min(10, tier * 0.35),
+    length: 21 + Math.min(8, tier * 0.28),
     startSquad: start,
     bossHealth: bossHealthFor(stage, failures),
     segments,

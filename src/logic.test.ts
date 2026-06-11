@@ -4,11 +4,15 @@ import {
   applyAutomaticUpgrades,
   applyGate,
   bossHealthFor,
+  carrySquadForNextStage,
+  encounterHealth,
   formatCount,
   getStageDefinition,
   migrateSave,
+  squadDps,
   startingSquad,
   upgradeCost,
+  visibleVolleyCount,
   weaponDps,
 } from "./logic";
 
@@ -46,6 +50,12 @@ describe("Squad Rush rules", () => {
     for (const gate of gates) {
       expect([gate.left, gate.right].some((choice) => choice.operation !== "subtract")).toBe(true);
     }
+    const multipliers = gates.flatMap((gate) => [gate.left, gate.right])
+      .filter((choice) => choice.operation === "multiply");
+    expect(multipliers.length).toBeLessThanOrEqual(1);
+    expect(multipliers.every((choice) => choice.value === 2)).toBe(true);
+    const weaponGates = first.segments.filter((segment) => segment.type === "weapon");
+    expect(weaponGates.every((gate) => gate.left !== gate.right)).toBe(true);
   });
 
   it("scales gently and applies failure mercy to bosses", () => {
@@ -59,7 +69,44 @@ describe("Squad Rush rules", () => {
     expect(startingSquad(1, upgrades)).toBe(14);
     expect(weaponDps("machineGun", upgrades)).toBeGreaterThan(weaponDps("machineGun", DEFAULT_SAVE.upgrades));
     expect(upgradeCost("damage", 3)).toBeGreaterThan(upgradeCost("damage", 2));
-    expect(startingSquad(8, upgrades, 50_000)).toBe(50_000);
+    expect(startingSquad(8, upgrades, 50_000)).toBeLessThan(500);
+  });
+
+  it("keeps fixed gates and enemy density within a controlled level curve", () => {
+    for (let stage = 1; stage <= 7; stage += 1) {
+      const definition = getStageDefinition(stage);
+      const gates = definition.segments.filter((segment) => segment.type === "gates");
+      const choices = gates.flatMap((gate) => [gate.left, gate.right]);
+      expect(choices.filter((choice) => choice.operation === "multiply").length).toBeLessThanOrEqual(1);
+      expect(choices.every((choice) => choice.operation !== "multiply" || choice.value === 2)).toBe(true);
+      expect(Math.max(...choices.filter((choice) => choice.operation === "add").map((choice) => choice.value)))
+        .toBeLessThanOrEqual(30);
+      const enemies = definition.segments.filter((segment) => segment.type === "enemies");
+      expect(enemies.length).toBeGreaterThanOrEqual(5);
+      expect(enemies.every((wave) => wave.count >= 12)).toBe(true);
+    }
+  });
+
+  it("scales visible volleys without spawning one projectile per huge squad", () => {
+    expect(visibleVolleyCount(5, "blaster")).toBeLessThan(visibleVolleyCount(100, "blaster"));
+    expect(visibleVolleyCount(100, "blaster")).toBeLessThanOrEqual(visibleVolleyCount(10_000, "blaster"));
+    expect(visibleVolleyCount(10_000, "blaster")).toBe(50);
+    expect(visibleVolleyCount(10_000, "rocket")).toBeLessThanOrEqual(50);
+  });
+
+  it("derives encounter durability from the actual squad firepower", () => {
+    const upgrades = { squad: 0, damage: 2, fireRate: 1 };
+    const dps = squadDps(80, "machineGun", upgrades);
+    const health = encounterHealth(80, "machineGun", upgrades, 8);
+    expect(health / dps).toBeCloseTo(8, 1);
+    expect(encounterHealth(160, "machineGun", upgrades, 8)).toBeGreaterThan(health);
+  });
+
+  it("soft-caps the squad carried into the next level", () => {
+    const upgrades = { squad: 2, damage: 0, fireRate: 0 };
+    const carried = carrySquadForNextStage(50_000, 8, upgrades);
+    expect(carried).toBeLessThan(500);
+    expect(startingSquad(8, upgrades, carried)).toBe(carried);
   });
 
   it("automatically purchases balanced upgrades without overspending", () => {
