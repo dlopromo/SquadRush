@@ -6,6 +6,8 @@ type ToneOptions = {
   endFrequency?: number;
 };
 
+type WeaponType = "blaster" | "machineGun" | "shotgun" | "rocket";
+
 export class AudioEngine {
   private context: AudioContext | null = null;
   private master: GainNode | null = null;
@@ -71,6 +73,25 @@ export class AudioEngine {
 
   gate(): void {
     this.chord([220, 329.63, 440], 0.22, "triangle", 0.04);
+  }
+
+  shoot(weapon: WeaponType): void {
+    if (weapon === "machineGun") {
+      this.noise(0.025, 0.018);
+      this.tone({ frequency: 260, endFrequency: 150, duration: 0.035, type: "square", gain: 0.025 });
+      return;
+    }
+    if (weapon === "shotgun") {
+      this.noise(0.09, 0.055);
+      this.tone({ frequency: 130, endFrequency: 62, duration: 0.12, type: "sawtooth", gain: 0.055 });
+      return;
+    }
+    if (weapon === "rocket") {
+      this.noise(0.16, 0.045);
+      this.tone({ frequency: 95, endFrequency: 38, duration: 0.22, type: "sawtooth", gain: 0.05 });
+      return;
+    }
+    this.tone({ frequency: 510, endFrequency: 250, duration: 0.06, type: "square", gain: 0.025 });
   }
 
   boss(): void {

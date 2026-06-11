@@ -1,30 +1,60 @@
 import { AudioEngine } from "./audio";
 import {
-  canDefeat,
+  WEAPONS,
+  applyAutomaticUpgrades,
+  applyGate,
   clamp,
+  formatCount,
   formatScore,
-  moveLane,
-  progressAt,
-  resolveDamage,
-  resolveGate,
-  resolveRecruit,
-  zoneAt,
+  getStageDefinition,
+  type GameSave,
+  type GateChoice,
+  type StageDefinition,
+  type StageSegment,
+  type WeaponType,
 } from "./logic";
 
-type GameState = "menu" | "playing" | "paused" | "won" | "lost";
-type EntityKind = "recruit" | "crystal" | "hazard" | "enemy" | "gate";
-type GateOperation = "add" | "multiply";
+export type GameState = "menu" | "playing" | "paused" | "stageClear" | "lost";
 
-type Entity = {
+type TargetKind = "enemy" | "tires" | "boss";
+
+type Target = {
   id: number;
-  kind: EntityKind;
-  lane: number;
+  kind: TargetKind;
+  x: number;
   y: number;
-  size: number;
-  value: number;
-  operation?: GateOperation;
-  hit: boolean;
+  health: number;
+  maxHealth: number;
+  radius: number;
+  dead: boolean;
   phase: number;
+};
+
+type GatePair = {
+  id: number;
+  y: number;
+  left: GateChoice;
+  right: GateChoice;
+  passed: boolean;
+};
+
+type WeaponGate = {
+  id: number;
+  y: number;
+  left: WeaponType;
+  right: WeaponType;
+  passed: boolean;
+};
+
+type Projectile = {
+  x: number;
+  y: number;
+  vx: number;
+  vy: number;
+  damage: number;
+  splash: number;
+  color: string;
+  life: number;
 };
 
 type Particle = {
@@ -38,84 +68,122 @@ type Particle = {
   size: number;
 };
 
-type Bolt = {
-  lane: number;
+type CoinFx = {
+  x: number;
   y: number;
-  speed: number;
-};
-
-type GameCallbacks = {
-  onStateChange: (state: GameState) => void;
-  onHudUpdate: (data: HudData) => void;
-  onToast: (message: string, tone?: "good" | "bad" | "neutral") => void;
-  onEnd: (result: GameResult) => void;
+  startX: number;
+  startY: number;
+  life: number;
+  delay: number;
 };
 
 export type HudData = {
   squad: number;
   score: number;
   progress: number;
-  zone: number;
+  stage: number;
+  coins: number;
+  combo: number;
+  weapon: WeaponType;
+  bossHealth: number | null;
+  bossMaxHealth: number | null;
 };
 
-export type GameResult = {
+export type StageResult = {
+  stage: number;
   won: boolean;
   score: number;
-  maxSquad: number;
+  squad: number;
+  coinsEarned: number;
+  upgraded: Array<keyof GameSave["upgrades"]>;
+  save: GameSave;
 };
 
-const GAME_DURATION = 52;
-const BOSS_START = 0.84;
-const ZONES = [
-  { name: "青青草原", bg: "#86d7ff", road: "#e9d5aa", accent: "#64b84d" },
-  { name: "櫻花山道", bg: "#9bdcff", road: "#e7cda7", accent: "#f58bb2" },
-  { name: "巨人城堡", bg: "#ffc777", road: "#d9c19a", accent: "#ef765c" },
-] as const;
+type GameCallbacks = {
+  onStateChange: (state: GameState) => void;
+  onHudUpdate: (data: HudData) => void;
+  onMessage: (message: string, tone?: "good" | "bad" | "weapon") => void;
+  onStageEnd: (result: StageResult) => void;
+  onSave: (save: GameSave) => void;
+};
 
-export class SwarmGame {
+const ROAD_MIN_X = 0.16;
+const ROAD_MAX_X = 0.84;
+const PLAYER_Y = 0.87;
+const TRAVEL_SPEED = 0.055;
+const TARGET_SPEED = 0.18;
+const SEGMENT_LOOKAHEAD = 0.17;
+const WEAPON_LABELS: Record<WeaponType, string> = {
+  blaster: "BLASTER",
+  machineGun: "MINIGUN",
+  shotgun: "SHOTGUN",
+  rocket: "ROCKET",
+};
+
+export class SquadRushGame {
   private canvas: HTMLCanvasElement;
   private context: CanvasRenderingContext2D;
   private audio: AudioEngine;
   private callbacks: GameCallbacks;
+  private save: GameSave;
   private width = 0;
   private height = 0;
   private dpr = 1;
   private state: GameState = "menu";
-  private lastTime = 0;
-  private elapsed = 0;
-  private lane = 1;
-  private playerX = 0;
-  private targetX = 0;
-  private squad = 6;
-  private maxSquad = 6;
+  private stage: StageDefinition;
+  private progress = 0;
+  private playerX = 0.5;
+  private targetX = 0.5;
+  private pointerActive = false;
+  private leftHeld = false;
+  private rightHeld = false;
+  private squad = 5;
+  private weapon: WeaponType = "blaster";
   private score = 0;
-  private energy = 0;
-  private entities: Entity[] = [];
+  private stageCoins = 0;
+  private combo = 0;
+  private comboTimer = 0;
+  private maxSquad = 5;
+  private targets: Target[] = [];
+  private gates: GatePair[] = [];
+  private weaponGates: WeaponGate[] = [];
+  private projectiles: Projectile[] = [];
   private particles: Particle[] = [];
-  private bolts: Bolt[] = [];
-  private spawnTimer = 0;
-  private entityId = 0;
+  private coinFx: CoinFx[] = [];
+  private spawnedSegments = new Set<number>();
+  private nextId = 1;
+  private fireTimer = 0;
+  private lastTime = 0;
   private roadOffset = 0;
   private shake = 0;
   private flash = 0;
-  private bossHealth = 100;
   private bossActive = false;
-  private bossShotTimer = 0;
-  private pointerActive = false;
-  private previousPointerX = 0;
-  private backgroundSeed = Array.from({ length: 32 }, (_, index) => ({
-    x: ((index * 47) % 101) / 100,
-    y: ((index * 73) % 97) / 96,
-    size: 1 + (index % 3),
-  }));
+  private boss: Target | null = null;
+  private transitionTimer = 0;
+  private messageText = "";
+  private messageLife = 0;
+  private rushPulse = 0;
 
-  constructor(canvas: HTMLCanvasElement, audio: AudioEngine, callbacks: GameCallbacks) {
+  constructor(
+    canvas: HTMLCanvasElement,
+    audio: AudioEngine,
+    save: GameSave,
+    callbacks: GameCallbacks,
+  ) {
     const context = canvas.getContext("2d");
-    if (!context) throw new Error("Canvas 2D is not available");
+    if (!context) throw new Error("Canvas 2D is unavailable");
     this.canvas = canvas;
     this.context = context;
     this.audio = audio;
+    this.save = structuredClone(save);
     this.callbacks = callbacks;
+    this.stage = getStageDefinition(
+      this.save.currentStage,
+      this.save.failures,
+      this.save.upgrades,
+      20260611,
+      this.save.carrySquad,
+    );
     this.bindInputs();
     this.resize();
     window.addEventListener("resize", () => this.resize());
@@ -123,25 +191,11 @@ export class SwarmGame {
   }
 
   start(): void {
-    this.elapsed = 0;
-    this.lane = 1;
-    this.squad = 6;
-    this.maxSquad = 6;
-    this.score = 0;
-    this.energy = 0;
-    this.entities = [];
-    this.particles = [];
-    this.bolts = [];
-    this.spawnTimer = 0.45;
-    this.roadOffset = 0;
-    this.shake = 0;
-    this.flash = 0;
-    this.bossHealth = 100;
-    this.bossActive = false;
-    this.bossShotTimer = 0.8;
-    this.playerX = this.laneX(this.lane);
-    this.targetX = this.playerX;
-    this.setState("playing");
+    this.loadStage(this.save.currentStage);
+  }
+
+  retry(): void {
+    this.loadStage(this.save.currentStage);
   }
 
   togglePause(): void {
@@ -160,6 +214,46 @@ export class SwarmGame {
     }
   }
 
+  getSave(): GameSave {
+    return structuredClone(this.save);
+  }
+
+  private loadStage(stageNumber: number): void {
+    this.stage = getStageDefinition(
+      stageNumber,
+      this.save.failures,
+      this.save.upgrades,
+      20260611,
+      this.save.carrySquad,
+    );
+    this.progress = 0;
+    this.playerX = 0.5;
+    this.targetX = 0.5;
+    this.squad = this.stage.startSquad;
+    this.maxSquad = this.squad;
+    this.weapon = "blaster";
+    this.score = 0;
+    this.stageCoins = 0;
+    this.combo = 0;
+    this.comboTimer = 0;
+    this.targets = [];
+    this.gates = [];
+    this.weaponGates = [];
+    this.projectiles = [];
+    this.particles = [];
+    this.coinFx = [];
+    this.spawnedSegments.clear();
+    this.fireTimer = 0;
+    this.roadOffset = 0;
+    this.shake = 0;
+    this.flash = 0;
+    this.bossActive = false;
+    this.boss = null;
+    this.transitionTimer = 0;
+    this.showMessage(`STAGE ${stageNumber}`, "good", 1.4);
+    this.setState("playing");
+  }
+
   private setState(state: GameState): void {
     this.state = state;
     this.callbacks.onStateChange(state);
@@ -171,629 +265,736 @@ export class SwarmGame {
         this.togglePause();
         return;
       }
-      if (this.state !== "playing" || event.repeat) return;
       if (event.key === "ArrowLeft" || event.key.toLowerCase() === "a") {
         event.preventDefault();
-        this.shiftLane(-1);
+        this.leftHeld = true;
       }
       if (event.key === "ArrowRight" || event.key.toLowerCase() === "d") {
         event.preventDefault();
-        this.shiftLane(1);
+        this.rightHeld = true;
       }
     });
-
+    window.addEventListener("keyup", (event) => {
+      if (event.key === "ArrowLeft" || event.key.toLowerCase() === "a") this.leftHeld = false;
+      if (event.key === "ArrowRight" || event.key.toLowerCase() === "d") this.rightHeld = false;
+    });
     this.canvas.addEventListener("pointerdown", (event) => {
       if (this.state !== "playing") return;
       this.pointerActive = true;
-      this.previousPointerX = event.clientX;
       this.canvas.setPointerCapture(event.pointerId);
+      this.updatePointer(event);
     });
     this.canvas.addEventListener("pointermove", (event) => {
-      if (!this.pointerActive || this.state !== "playing") return;
-      const rect = this.canvas.getBoundingClientRect();
-      const localX = event.clientX - rect.left;
-      const nextLane = clamp(Math.floor((localX / rect.width) * 3), 0, 2);
-      if (nextLane !== this.lane && Math.abs(event.clientX - this.previousPointerX) > 4) {
-        this.lane = nextLane;
-        this.targetX = this.laneX(this.lane);
-        this.audio.move();
-        this.previousPointerX = event.clientX;
-      }
+      if (this.pointerActive && this.state === "playing") this.updatePointer(event);
     });
-    const releasePointer = () => {
+    const release = () => {
       this.pointerActive = false;
     };
-    this.canvas.addEventListener("pointerup", releasePointer);
-    this.canvas.addEventListener("pointercancel", releasePointer);
+    this.canvas.addEventListener("pointerup", release);
+    this.canvas.addEventListener("pointercancel", release);
   }
 
-  private shiftLane(direction: -1 | 1): void {
-    const next = moveLane(this.lane, direction);
-    if (next === this.lane) return;
-    this.lane = next;
-    this.targetX = this.laneX(this.lane);
-    this.audio.move();
+  private updatePointer(event: PointerEvent): void {
+    const rect = this.canvas.getBoundingClientRect();
+    const normalized = (event.clientX - rect.left) / rect.width;
+    this.targetX = clamp(normalized, ROAD_MIN_X, ROAD_MAX_X);
   }
 
   private resize(): void {
     const rect = this.canvas.getBoundingClientRect();
     this.dpr = Math.min(window.devicePixelRatio || 1, 2);
     this.width = Math.max(320, rect.width);
-    this.height = Math.max(480, rect.height);
+    this.height = Math.max(520, rect.height);
     this.canvas.width = Math.floor(this.width * this.dpr);
     this.canvas.height = Math.floor(this.height * this.dpr);
     this.context.setTransform(this.dpr, 0, 0, this.dpr, 0, 0);
-    this.playerX = this.laneX(this.lane);
-    this.targetX = this.playerX;
   }
 
   private loop(time: number): void {
     const delta = Math.min((time - this.lastTime) / 1000 || 0, 0.05);
     this.lastTime = time;
     if (this.state === "playing") this.update(delta);
+    if (this.state === "stageClear") this.updateTransition(delta);
     this.render(time / 1000);
-    requestAnimationFrame((nextTime) => this.loop(nextTime));
+    requestAnimationFrame((next) => this.loop(next));
   }
 
   private update(delta: number): void {
-    const progress = progressAt(this.elapsed, GAME_DURATION);
-    const bossWasActive = this.bossActive;
-    this.elapsed += delta;
-    this.roadOffset = (this.roadOffset + delta * (280 + progress * 100)) % 120;
-    this.playerX += (this.targetX - this.playerX) * Math.min(1, delta * 12);
-    this.shake = Math.max(0, this.shake - delta * 2.8);
-    this.flash = Math.max(0, this.flash - delta * 3.2);
-    this.audio.updateMusic(delta, progress);
+    const direction = Number(this.rightHeld) - Number(this.leftHeld);
+    if (direction !== 0) this.targetX = clamp(this.targetX + direction * delta * 0.54, ROAD_MIN_X, ROAD_MAX_X);
+    this.playerX += (this.targetX - this.playerX) * Math.min(1, delta * 11);
+    this.roadOffset = (this.roadOffset + delta * 260) % 105;
+    this.shake = Math.max(0, this.shake - delta * 3.4);
+    this.flash = Math.max(0, this.flash - delta * 3.5);
+    this.messageLife = Math.max(0, this.messageLife - delta);
+    this.rushPulse = Math.max(0, this.rushPulse - delta * 2.4);
+    this.comboTimer -= delta;
+    if (this.comboTimer <= 0) this.combo = 0;
+    this.audio.updateMusic(delta, Math.min(1, this.stage.stage / 12));
 
-    if (progress >= BOSS_START) {
-      this.bossActive = true;
-      if (!bossWasActive) {
-        this.entities = [];
-        this.audio.boss();
-        this.callbacks.onToast("小心！城堡巨人出現了", "bad");
+    if (!this.bossActive) {
+      this.progress = Math.min(1, this.progress + (TRAVEL_SPEED / this.stage.length) * 22 * delta);
+      this.spawnSegments();
+      if (this.progress >= 0.985 && this.targets.length === 0 && this.gates.length === 0 && this.weaponGates.length === 0) {
+        this.spawnBoss();
       }
-      this.updateBoss(delta, progress);
-    } else {
-      this.updateSpawning(delta, progress);
     }
 
-    const speed = 285 + progress * 115;
-    this.entities.forEach((entity) => {
-      entity.y += speed * delta;
-      entity.phase += delta;
-      if (!entity.hit && entity.y > this.height * 0.72 && entity.y < this.height * 0.88) {
-        if (Math.abs(this.playerX - this.laneX(entity.lane)) < this.laneWidth() * 0.35) {
-          this.resolveEntity(entity);
+    this.updateWorld(delta);
+    this.updateFiring(delta);
+    this.updateProjectiles(delta);
+    this.updateParticles(delta);
+    this.updateCoinFx(delta);
+
+    this.score += delta * (12 + this.combo * 1.8);
+    this.maxSquad = Math.max(this.maxSquad, this.squad);
+    this.pushHud();
+  }
+
+  private spawnSegments(): void {
+    this.stage.segments.forEach((segment, index) => {
+      if (this.spawnedSegments.has(index)) return;
+      if (segment.at <= this.progress + SEGMENT_LOOKAHEAD) {
+        this.spawnedSegments.add(index);
+        this.spawnSegment(segment);
+      }
+    });
+  }
+
+  private spawnSegment(segment: StageSegment): void {
+    if (segment.type === "gates") {
+      this.gates.push({ id: this.nextId++, y: -85, left: segment.left, right: segment.right, passed: false });
+      return;
+    }
+    if (segment.type === "weapon") {
+      this.weaponGates.push({ id: this.nextId++, y: -85, left: segment.left, right: segment.right, passed: false });
+      return;
+    }
+    if (segment.type === "tires") {
+      this.targets.push({
+        id: this.nextId++,
+        kind: "tires",
+        x: segment.x,
+        y: -70,
+        health: segment.health,
+        maxHealth: segment.health,
+        radius: 34,
+        dead: false,
+        phase: 0,
+      });
+      return;
+    }
+    const columns = Math.max(1, Math.min(3, Math.ceil(segment.count / 4)));
+    for (let index = 0; index < segment.count; index += 1) {
+      const column = index % columns;
+      const row = Math.floor(index / columns);
+      const x = 0.5 + (column - (columns - 1) / 2) * segment.spread * 0.52;
+      this.targets.push({
+        id: this.nextId++,
+        kind: "enemy",
+        x,
+        y: -45 - row * 44,
+        health: segment.health,
+        maxHealth: segment.health,
+        radius: 15,
+        dead: false,
+        phase: index * 0.7,
+      });
+    }
+  }
+
+  private spawnBoss(): void {
+    this.bossActive = true;
+    this.audio.boss();
+    this.boss = {
+      id: this.nextId++,
+      kind: "boss",
+      x: 0.5,
+      y: this.height * 0.19,
+      health: this.stage.bossHealth,
+      maxHealth: this.stage.bossHealth,
+      radius: 62,
+      dead: false,
+      phase: 0,
+    };
+    this.targets.push(this.boss);
+    this.showMessage("BOSS!", "bad", 1.2);
+  }
+
+  private updateWorld(delta: number): void {
+    const speed = this.height * TARGET_SPEED;
+    this.gates.forEach((gate) => {
+      gate.y += speed * delta;
+      if (!gate.passed && gate.y >= this.height * 0.76) {
+        gate.passed = true;
+        const choice = this.playerX < 0.5 ? gate.left : gate.right;
+        const before = this.squad;
+        this.squad = applyGate(this.squad, choice);
+        const difference = this.squad - before;
+        this.audio.gate();
+        this.burst(this.px(this.playerX), this.height * PLAYER_Y, difference >= 0 ? "#62d472" : "#ff6d77", 24);
+        this.showMessage(`${this.gateLabel(choice)} ${difference >= 0 ? `+${difference}` : difference}`, difference >= 0 ? "good" : "bad");
+      }
+    });
+    this.gates = this.gates.filter((gate) => gate.y < this.height + 100 && !gate.passed);
+
+    this.weaponGates.forEach((gate) => {
+      gate.y += speed * delta;
+      if (!gate.passed && gate.y >= this.height * 0.76) {
+        gate.passed = true;
+        this.weapon = this.playerX < 0.5 ? gate.left : gate.right;
+        this.audio.gate();
+        this.showMessage(WEAPON_LABELS[this.weapon], "weapon", 1.25);
+      }
+    });
+    this.weaponGates = this.weaponGates.filter((gate) => gate.y < this.height + 100 && !gate.passed);
+
+    this.targets.forEach((target) => {
+      if (target.dead || target.kind === "boss") return;
+      target.y += speed * delta;
+      target.phase += delta;
+      if (target.y >= this.height * 0.83) this.collideTarget(target);
+    });
+    this.targets = this.targets.filter((target) => !target.dead && target.y < this.height + 100);
+  }
+
+  private updateFiring(delta: number): void {
+    this.fireTimer -= delta;
+    const target = this.findTarget();
+    if (!target || this.fireTimer > 0) return;
+    const stats = WEAPONS[this.weapon];
+    const rateMultiplier = 1 + this.save.upgrades.fireRate * 0.08;
+    this.fireTimer = stats.interval / rateMultiplier;
+    const shots = Math.min(stats.pellets, this.weapon === "shotgun" ? 5 : 1);
+    const originX = this.px(this.playerX);
+    const originY = this.height * (PLAYER_Y - 0.05);
+    for (let index = 0; index < shots; index += 1) {
+      const spread = shots === 1 ? 0 : (index - (shots - 1) / 2) * 0.085;
+      const targetX = this.px(target.x + spread);
+      const targetY = target.y;
+      const angle = Math.atan2(targetY - originY, targetX - originX);
+      const crowdPower = Math.max(1, Math.sqrt(this.squad) * 1.38 + Math.log10(this.squad + 1) * 0.9);
+      const damage = stats.damage * (1 + this.save.upgrades.damage * 0.12) * crowdPower;
+      this.projectiles.push({
+        x: originX,
+        y: originY,
+        vx: Math.cos(angle) * 760,
+        vy: Math.sin(angle) * 760,
+        damage,
+        splash: stats.splash,
+        color: this.weapon === "rocket" ? "#ff8a3d" : this.weapon === "shotgun" ? "#ffe277" : "#fff4a9",
+        life: 1.2,
+      });
+    }
+    this.audio.shoot(this.weapon);
+  }
+
+  private findTarget(): Target | null {
+    const live = this.targets.filter((target) => !target.dead && target.y < this.height * 0.82);
+    if (live.length === 0) return null;
+    return live.sort((a, b) => b.y - a.y || Math.abs(a.x - this.playerX) - Math.abs(b.x - this.playerX))[0];
+  }
+
+  private updateProjectiles(delta: number): void {
+    this.projectiles.forEach((projectile) => {
+      projectile.x += projectile.vx * delta;
+      projectile.y += projectile.vy * delta;
+      projectile.life -= delta;
+      for (const target of this.targets) {
+        if (target.dead) continue;
+        const dx = projectile.x - this.px(target.x);
+        const dy = projectile.y - target.y;
+        if (dx * dx + dy * dy < (target.radius + 8) ** 2) {
+          projectile.life = 0;
+          this.damageTarget(target, projectile.damage, projectile.splash);
+          break;
         }
       }
     });
-    this.entities = this.entities.filter((entity) => entity.y < this.height + 100 && !entity.hit);
+    this.projectiles = this.projectiles.filter((projectile) => projectile.life > 0);
+  }
 
-    this.bolts.forEach((bolt) => {
-      bolt.y += bolt.speed * delta;
-      if (
-        bolt.y > this.height * 0.72 &&
-        bolt.y < this.height * 0.88 &&
-        Math.abs(this.playerX - this.laneX(bolt.lane)) < this.laneWidth() * 0.3
-      ) {
-        bolt.y = this.height + 100;
-        const damage = Math.max(2, Math.ceil(this.squad * 0.16));
-        this.squad = resolveDamage(this.squad, damage);
-        this.shake = 0.75;
-        this.flash = 0.55;
-        this.audio.hit();
-        this.burst(this.playerX, this.height * 0.79, "#ff704d", 16);
-        this.callbacks.onToast(`巨石命中 −${damage}`, "bad");
-        if (this.squad <= 0) this.finish(false);
-      }
+  private damageTarget(target: Target, damage: number, splash: number): void {
+    target.health -= damage;
+    this.burst(this.px(target.x), target.y, target.kind === "tires" ? "#555555" : "#ff665c", 3);
+    const splashDeaths: Target[] = [];
+    if (splash > 0) {
+      this.targets.forEach((other) => {
+        if (other === target || other.dead) return;
+        const dx = this.px(other.x) - this.px(target.x);
+        const dy = other.y - target.y;
+        if (dx * dx + dy * dy < splash * splash) {
+          other.health -= damage * 0.42;
+          if (other.health <= 0) splashDeaths.push(other);
+        }
+      });
+    }
+    if (target.health <= 0) this.killTarget(target);
+    splashDeaths.forEach((other) => this.killTarget(other));
+  }
+
+  private killTarget(target: Target): void {
+    target.dead = true;
+    const reward = target.kind === "boss" ? 30 + this.stage.stage * 6 : target.kind === "tires" ? 5 : 1;
+    this.stageCoins += reward;
+    this.combo += 1;
+    this.comboTimer = 2.6;
+    this.rushPulse = Math.min(1, this.rushPulse + 0.18);
+    this.score += reward * 50 * Math.max(1, this.combo);
+    this.audio.hit();
+    this.burst(
+      this.px(target.x),
+      target.y,
+      target.kind === "boss" ? "#b45cff" : this.combo >= 10 ? "#ffd84f" : "#ff765f",
+      target.kind === "boss" ? 90 : 18 + Math.min(18, this.combo),
+    );
+    this.spawnCoins(this.px(target.x), target.y, Math.min(8, Math.max(1, Math.ceil(reward / 4))));
+    if (target.kind === "boss") this.completeStage();
+    else if (this.combo > 1 && this.combo % 5 === 0) this.showMessage(`${this.combo} COMBO`, "good", 0.8);
+  }
+
+  private collideTarget(target: Target): void {
+    target.dead = true;
+    const loss = target.kind === "tires"
+      ? Math.max(1, Math.ceil(target.health / 22))
+      : Math.max(1, Math.ceil(target.health / 9));
+    this.squad = Math.max(0, this.squad - loss);
+    this.combo = 0;
+    this.shake = 0.8;
+    this.flash = 0.6;
+    this.audio.hit();
+    this.showMessage(`-${loss}`, "bad", 0.75);
+    this.burst(this.px(this.playerX), this.height * PLAYER_Y, "#ff5b61", 28);
+    if (this.squad <= 0) this.failStage();
+  }
+
+  private completeStage(): void {
+    if (this.state !== "playing") return;
+    this.audio.win();
+    this.save.coins += this.stageCoins;
+    this.save.carrySquad = Math.max(this.save.carrySquad, Math.floor(this.squad * 1.12));
+    this.save.currentStage = this.stage.stage + 1;
+    this.save.highestStage = Math.max(this.save.highestStage, this.save.currentStage);
+    this.save.bestScore = Math.max(this.save.bestScore, Math.floor(this.score));
+    this.save.failures = 0;
+    const upgradeResult = applyAutomaticUpgrades(this.save);
+    this.save = upgradeResult.save;
+    this.callbacks.onSave(this.getSave());
+    this.transitionTimer = 2.6;
+    this.setState("stageClear");
+    this.callbacks.onStageEnd({
+      stage: this.stage.stage,
+      won: true,
+      score: Math.floor(this.score),
+      squad: this.squad,
+      coinsEarned: this.stageCoins,
+      upgraded: upgradeResult.upgraded,
+      save: this.getSave(),
     });
-    this.bolts = this.bolts.filter((bolt) => bolt.y < this.height + 80);
+  }
 
+  private failStage(): void {
+    if (this.state !== "playing") return;
+    this.audio.lose();
+    this.save.coins += this.stageCoins;
+    this.save.failures += 1;
+    this.save.bestScore = Math.max(this.save.bestScore, Math.floor(this.score));
+    this.callbacks.onSave(this.getSave());
+    this.setState("lost");
+    this.callbacks.onStageEnd({
+      stage: this.stage.stage,
+      won: false,
+      score: Math.floor(this.score),
+      squad: 0,
+      coinsEarned: this.stageCoins,
+      upgraded: [],
+      save: this.getSave(),
+    });
+  }
+
+  private updateTransition(delta: number): void {
+    this.transitionTimer -= delta;
+    this.updateParticles(delta);
+    this.updateCoinFx(delta);
+    if (this.transitionTimer <= 0) this.loadStage(this.save.currentStage);
+  }
+
+  private updateParticles(delta: number): void {
     this.particles.forEach((particle) => {
       particle.x += particle.vx * delta;
       particle.y += particle.vy * delta;
-      particle.vy += 45 * delta;
+      particle.vy += 85 * delta;
       particle.life -= delta;
     });
     this.particles = this.particles.filter((particle) => particle.life > 0);
+  }
 
-    this.score += delta * (35 + this.squad * 0.8);
-    this.maxSquad = Math.max(this.maxSquad, this.squad);
+  private pushHud(): void {
     this.callbacks.onHudUpdate({
       squad: this.squad,
       score: this.score,
-      progress,
-      zone: zoneAt(progress),
+      progress: this.progress,
+      stage: this.stage.stage,
+      coins: this.save.coins + this.stageCoins,
+      combo: this.combo,
+      weapon: this.weapon,
+      bossHealth: this.boss && !this.boss.dead ? Math.max(0, this.boss.health) : null,
+      bossMaxHealth: this.boss && !this.boss.dead ? this.boss.maxHealth : null,
     });
   }
 
-  private updateSpawning(delta: number, progress: number): void {
-    this.spawnTimer -= delta;
-    if (this.spawnTimer > 0) return;
-    const difficulty = progress * 0.24;
-    this.spawnTimer = Math.max(0.42, 0.76 - difficulty) + Math.random() * 0.16;
-
-    const roll = Math.random();
-    let kind: EntityKind = "recruit";
-    if (roll > 0.78) kind = "enemy";
-    else if (roll > 0.63) kind = "hazard";
-    else if (roll > 0.47) kind = "crystal";
-    else if (roll > 0.35 && progress > 0.12) kind = "gate";
-
-    const lane = Math.floor(Math.random() * 3);
-    const basePower = Math.max(2, Math.floor(3 + progress * 9));
-    const entity: Entity = {
-      id: this.entityId++,
-      kind,
-      lane,
-      y: -70,
-      size: kind === "gate" ? 48 : 34,
-      value: basePower,
-      hit: false,
-      phase: Math.random() * 10,
-    };
-
-    if (kind === "recruit") entity.value = 2 + Math.floor(Math.random() * 5);
-    if (kind === "crystal") entity.value = 80 + Math.floor(Math.random() * 80);
-    if (kind === "hazard") entity.value = 2 + Math.floor(progress * 5);
-    if (kind === "enemy") entity.value = basePower + Math.floor(Math.random() * 4);
-    if (kind === "gate") {
-      entity.operation = Math.random() > 0.55 ? "multiply" : "add";
-      entity.value = entity.operation === "multiply" ? 1.5 : 5 + Math.floor(progress * 7);
-    }
-    this.entities.push(entity);
-
-    if (Math.random() > 0.77 && kind !== "gate") {
-      const secondLane = (lane + 1 + Math.floor(Math.random() * 2)) % 3;
-      const alternateKind: EntityKind = kind === "enemy" || kind === "hazard" ? "recruit" : "hazard";
-      this.entities.push({
-        id: this.entityId++,
-        kind: alternateKind,
-        lane: secondLane,
-        y: -70,
-        size: 34,
-        value: alternateKind === "recruit" ? 3 + Math.floor(Math.random() * 4) : 2 + Math.floor(progress * 4),
-        hit: false,
-        phase: Math.random() * 10,
-      });
-    }
+  private showMessage(message: string, tone: "good" | "bad" | "weapon", duration = 0.95): void {
+    this.messageText = message;
+    this.messageLife = duration;
+    this.callbacks.onMessage(message, tone);
   }
 
-  private updateBoss(delta: number, progress: number): void {
-    this.bossShotTimer -= delta;
-    if (this.bossShotTimer <= 0 && this.bossHealth > 0) {
-      this.bossShotTimer = Math.max(0.48, 0.9 - (progress - BOSS_START) * 2.2);
-      this.bolts.push({
-        lane: Math.floor(Math.random() * 3),
-        y: this.height * 0.22,
-        speed: 300 + progress * 90,
-      });
-    }
-    const damagePerSecond = 1.3 + this.squad * 0.19;
-    this.bossHealth = Math.max(0, this.bossHealth - damagePerSecond * delta);
-    this.score += damagePerSecond * delta * 10;
-    if (Math.random() < delta * 8) {
-      this.burst(
-        this.width / 2 + (Math.random() - 0.5) * this.width * 0.25,
-        this.height * 0.2 + (Math.random() - 0.5) * 50,
-        "#ffd343",
-        2,
-      );
-    }
-    if (this.bossHealth <= 0) this.finish(true);
-    else if (this.elapsed >= GAME_DURATION && this.bossHealth > 0) this.finish(false);
-  }
-
-  private resolveEntity(entity: Entity): void {
-    entity.hit = true;
-    const x = this.laneX(entity.lane);
-    const y = entity.y;
-    switch (entity.kind) {
-      case "recruit":
-        this.squad = resolveRecruit(this.squad, entity.value);
-        this.score += entity.value * 120;
-        this.audio.recruit();
-        this.burst(x, y, "#64c952", 14);
-        this.callbacks.onToast(`夥伴加入 +${entity.value}`, "good");
-        break;
-      case "crystal":
-        this.energy += entity.value;
-        this.score += entity.value;
-        if (this.energy >= 300) {
-          this.energy -= 300;
-          this.squad = resolveRecruit(this.squad, 4);
-          this.callbacks.onToast("士氣滿滿：夥伴 +4", "good");
-        } else {
-          this.callbacks.onToast(`金幣 +${entity.value}`, "neutral");
-        }
-        this.audio.crystal();
-        this.burst(x, y, "#ffd343", 12);
-        break;
-      case "hazard":
-        this.squad = resolveDamage(this.squad, entity.value);
-        this.shake = 0.55;
-        this.flash = 0.35;
-        this.audio.hit();
-        this.burst(x, y, "#ff704d", 18);
-        this.callbacks.onToast(`踩到陷阱 −${entity.value}`, "bad");
-        if (this.squad <= 0) this.finish(false);
-        break;
-      case "enemy":
-        if (canDefeat(this.squad, entity.value)) {
-          this.squad = resolveDamage(this.squad, entity.value);
-          this.score += entity.value * 180;
-          this.shake = 0.22;
-          this.audio.hit();
-          this.burst(x, y, "#ff835f", 24);
-          this.callbacks.onToast(`擊敗敵軍 −${entity.value}`, "neutral");
-        } else {
-          this.squad = 0;
-          this.shake = 1;
-          this.audio.lose();
-          this.burst(x, y, "#ef4b3e", 34);
-          this.finish(false);
-        }
-        break;
-      case "gate": {
-        const before = this.squad;
-        this.squad = resolveGate(this.squad, entity.operation ?? "add", entity.value);
-        this.score += (this.squad - before) * 100;
-        this.audio.gate();
-        this.burst(x, y, "#63c952", 22);
-        const label = entity.operation === "multiply" ? `×${entity.value}` : `+${entity.value}`;
-        this.callbacks.onToast(`魔法之門 ${label}`, "good");
-        break;
-      }
-    }
-    this.maxSquad = Math.max(this.maxSquad, this.squad);
-  }
-
-  private finish(won: boolean): void {
-    if (this.state !== "playing") return;
-    if (won) {
-      this.score += this.squad * 500 + 5000;
-      this.audio.win();
-    } else {
-      this.audio.lose();
-    }
-    this.setState(won ? "won" : "lost");
-    this.callbacks.onEnd({
-      won,
-      score: Math.floor(this.score),
-      maxSquad: this.maxSquad,
-    });
+  private gateLabel(gate: GateChoice): string {
+    if (gate.operation === "multiply") return `×${gate.value}`;
+    if (gate.operation === "subtract") return `-${gate.value}`;
+    return `+${gate.value}`;
   }
 
   private render(time: number): void {
     const context = this.context;
-    const progress = progressAt(this.elapsed, GAME_DURATION);
-    const zone = ZONES[zoneAt(progress)];
     context.save();
     if (this.shake > 0) {
-      context.translate((Math.random() - 0.5) * 14 * this.shake, (Math.random() - 0.5) * 10 * this.shake);
+      context.translate((Math.random() - 0.5) * 12 * this.shake, (Math.random() - 0.5) * 8 * this.shake);
     }
-    this.drawBackground(context, zone, progress, time);
-    this.drawRoad(context, zone, time);
-    this.entities.forEach((entity) => this.drawEntity(context, entity, time));
-    this.bolts.forEach((bolt) => this.drawBolt(context, bolt));
-    if (this.bossActive) this.drawBoss(context, time);
-    if (this.state !== "menu") this.drawSquad(context, time);
+    this.drawWorld(context, time);
+    this.drawGates(context);
+    this.drawWeaponGates(context);
+    this.targets.forEach((target) => this.drawTarget(context, target, time));
+    this.drawProjectiles(context);
+    if (this.state !== "menu") this.drawCrowd(context, time);
     this.drawParticles(context);
+    this.drawCoinFx(context);
+    if (this.messageLife > 0) this.drawCenterMessage(context);
+    if (this.rushPulse > 0) this.drawRushPulse(context);
     if (this.flash > 0) {
-      context.fillStyle = `rgba(255, 72, 35, ${this.flash * 0.22})`;
+      context.fillStyle = `rgba(255, 70, 75, ${this.flash * 0.2})`;
       context.fillRect(0, 0, this.width, this.height);
     }
     context.restore();
   }
 
-  private drawBackground(
-    context: CanvasRenderingContext2D,
-    zone: (typeof ZONES)[number],
-    progress: number,
-    time: number,
-  ): void {
-    context.fillStyle = zone.bg;
-    context.fillRect(0, 0, this.width, this.height);
-    const sky = context.createLinearGradient(0, 0, 0, this.height);
-    sky.addColorStop(0, zone.bg);
-    sky.addColorStop(0.5, "#dff5ff");
-    sky.addColorStop(0.501, zoneAt(progress) === 2 ? "#c8a36b" : "#83c969");
-    sky.addColorStop(1, zoneAt(progress) === 2 ? "#8f754f" : "#4c9d43");
+  private drawWorld(context: CanvasRenderingContext2D, time: number): void {
+    const sky = context.createLinearGradient(0, 0, 0, this.height * 0.48);
+    sky.addColorStop(0, "#b8dded");
+    sky.addColorStop(1, "#e9f3ed");
     context.fillStyle = sky;
     context.fillRect(0, 0, this.width, this.height);
+    context.fillStyle = "#65dc58";
+    context.fillRect(0, this.height * 0.27, this.width, this.height * 0.73);
 
-    context.fillStyle = "rgba(255,255,255,0.88)";
-    for (let index = 0; index < 6; index += 1) {
-      const cloudX = ((this.backgroundSeed[index].x * this.width + time * (5 + index)) % (this.width + 140)) - 70;
-      const cloudY = 50 + this.backgroundSeed[index].y * this.height * 0.22;
-      context.beginPath();
-      context.arc(cloudX, cloudY, 23, 0, Math.PI * 2);
-      context.arc(cloudX + 26, cloudY - 8, 30, 0, Math.PI * 2);
-      context.arc(cloudX + 57, cloudY + 2, 22, 0, Math.PI * 2);
-      context.fill();
-    }
+    this.drawTrees(context, time);
 
-    const horizon = this.height * 0.34;
-    context.fillStyle = zoneAt(progress) === 2 ? "#755d47" : "#67b756";
+    const leftTop = this.width * 0.32;
+    const rightTop = this.width * 0.68;
+    const leftBottom = this.width * 0.035;
+    const rightBottom = this.width * 0.965;
+    context.fillStyle = "#bfc4ca";
     context.beginPath();
-    context.moveTo(0, horizon + 38);
-    for (let x = 0; x <= this.width; x += 70) {
-      context.lineTo(x, horizon + Math.sin(x * 0.018) * 28);
-    }
-    context.lineTo(this.width, this.height);
-    context.lineTo(0, this.height);
+    context.moveTo(leftTop, 0);
+    context.lineTo(rightTop, 0);
+    context.lineTo(rightBottom, this.height);
+    context.lineTo(leftBottom, this.height);
     context.closePath();
     context.fill();
 
-    if (progress > 0.68) {
-      this.drawCastle(context, this.width / 2, horizon - 12);
-    } else {
-      for (let index = 0; index < 10; index += 1) {
-        const side = index % 2 === 0 ? 0.13 : 0.87;
-        const x = this.width * side + Math.sin(index * 4.1) * this.width * 0.08;
-        const y = horizon + 35 + (index % 5) * 68;
-        this.drawTree(context, x, y, zoneAt(progress) === 1);
-      }
-    }
-  }
-
-  private drawRoad(context: CanvasRenderingContext2D, zone: (typeof ZONES)[number], time: number): void {
-    const roadLeft = this.width * 0.08;
-    const roadRight = this.width * 0.92;
-    context.fillStyle = zone.road;
+    context.strokeStyle = "#ffffff";
+    context.lineWidth = Math.max(3, this.width * 0.008);
     context.beginPath();
-    context.moveTo(this.width * 0.31, 0);
-    context.lineTo(this.width * 0.69, 0);
-    context.lineTo(roadRight, this.height);
-    context.lineTo(roadLeft, this.height);
-    context.closePath();
-    context.fill();
-
-    context.strokeStyle = "rgba(112,82,51,0.42)";
-    context.lineWidth = 4;
-    context.beginPath();
-    context.moveTo(this.width * 0.31, 0);
-    context.lineTo(roadLeft, this.height);
-    context.moveTo(this.width * 0.69, 0);
-    context.lineTo(roadRight, this.height);
+    context.moveTo(leftTop, 0);
+    context.lineTo(leftBottom, this.height);
+    context.moveTo(rightTop, 0);
+    context.lineTo(rightBottom, this.height);
     context.stroke();
 
-    for (let y = -80 + this.roadOffset; y < this.height + 100; y += 120) {
-      const perspective = clamp(y / this.height, 0.08, 1);
-      context.fillStyle = perspective > 0.65 ? "rgba(132,100,63,0.22)" : "rgba(132,100,63,0.11)";
-      const laneWidth = this.laneWidthAt(y);
-      for (let lane = 0; lane < 3; lane += 1) {
-        const x = this.laneXAt(lane, y);
-        context.fillRect(x - laneWidth * 0.11, y, laneWidth * 0.22, 2 + perspective * 3);
-      }
-    }
-
-    const pebbleY = (time * 80) % this.height;
-    context.fillStyle = "rgba(128,92,57,0.22)";
+    context.save();
+    context.strokeStyle = "rgba(255,255,255,0.94)";
+    context.lineWidth = Math.max(3, this.width * 0.009);
+    context.setLineDash([32, 36]);
+    context.lineDashOffset = this.roadOffset;
     context.beginPath();
-    context.ellipse(this.width * 0.46, pebbleY, 6, 3, 0, 0, Math.PI * 2);
-    context.fill();
+    context.moveTo(this.width / 2, -20);
+    context.lineTo(this.width / 2, this.height + 20);
+    context.stroke();
+    context.restore();
+
+    context.strokeStyle = "#80878b";
+    context.lineWidth = 2;
+    for (const side of [-1, 1]) {
+      const bottom = side < 0 ? leftBottom - 8 : rightBottom + 8;
+      const top = side < 0 ? leftTop - 3 : rightTop + 3;
+      context.beginPath();
+      context.moveTo(top, 0);
+      context.lineTo(bottom, this.height);
+      context.stroke();
+    }
   }
 
-  private drawEntity(context: CanvasRenderingContext2D, entity: Entity, time: number): void {
-    const x = this.laneXAt(entity.lane, entity.y);
-    const scale = 0.45 + clamp(entity.y / this.height, 0, 1) * 0.75;
-    const size = entity.size * scale;
-    context.save();
-    context.translate(x, entity.y + Math.sin(time * 5 + entity.phase) * 3);
-    context.scale(scale, scale);
-
-    switch (entity.kind) {
-      case "recruit":
-        this.drawRunner(context, 0, 0, "#48aef0", 0.9, true);
-        context.fillStyle = "#2c8742";
-        this.drawLabel(context, `+${entity.value}`, 0, -32);
-        break;
-      case "crystal":
-        context.rotate(time * 1.8 + entity.phase);
-        context.shadowColor = "#ffd343";
-        context.shadowBlur = 18;
-        context.fillStyle = "#ffd343";
-        context.beginPath();
-        context.moveTo(0, -size * 0.56);
-        context.lineTo(size * 0.34, 0);
-        context.lineTo(0, size * 0.56);
-        context.lineTo(-size * 0.34, 0);
-        context.closePath();
-        context.fill();
-        context.shadowBlur = 0;
-        break;
-      case "hazard":
-        context.rotate(Math.sin(time * 2 + entity.phase) * 0.1);
-        context.fillStyle = "#7b5a3a";
-        for (let spike = 0; spike < 8; spike += 1) {
-          context.save();
-          context.rotate((spike / 8) * Math.PI * 2);
-          context.fillRect(-3, -30, 6, 17);
-          context.restore();
-        }
-        context.beginPath();
-        context.arc(0, 0, 18, 0, Math.PI * 2);
-        context.fill();
-        this.drawLabel(context, `−${entity.value}`, 0, -37, "#d84539");
-        break;
-      case "enemy":
-        this.drawEnemy(context, entity.value, time);
-        break;
-      case "gate": {
-        const accent = "#56c64e";
-        context.strokeStyle = accent;
-        context.lineWidth = 3;
-        context.shadowColor = accent;
-        context.shadowBlur = 12;
-        context.strokeRect(-36, -42, 72, 84);
-        context.shadowBlur = 0;
-        context.fillStyle = "rgba(255,255,255,0.68)";
-        context.fillRect(-34, -40, 68, 80);
-        const value = entity.operation === "multiply" ? `×${entity.value}` : `+${entity.value}`;
-        context.fillStyle = accent;
-        context.font = "800 21px 'Arial Narrow', sans-serif";
-        context.textAlign = "center";
-        context.textBaseline = "middle";
-        context.fillText(value, 0, 0);
-        break;
-      }
+  private drawTrees(context: CanvasRenderingContext2D, time: number): void {
+    for (let index = 0; index < 14; index += 1) {
+      const side = index % 2 === 0 ? -1 : 1;
+      const row = Math.floor(index / 2);
+      const y = ((row * 145 + this.roadOffset * 1.4) % (this.height + 180)) - 60;
+      const perspective = clamp(y / this.height, 0.15, 1);
+      const roadEdge = side < 0
+        ? this.width * (0.32 - 0.285 * perspective)
+        : this.width * (0.68 + 0.285 * perspective);
+      const x = roadEdge + side * (25 + (row % 3) * 18);
+      const scale = 0.35 + perspective * 0.75;
+      context.save();
+      context.translate(x, y + Math.sin(time + index) * 1.2);
+      context.scale(scale, scale);
+      context.fillStyle = "#75503a";
+      context.fillRect(-5, 2, 10, 34);
+      context.fillStyle = index % 3 === 0 ? "#2e9d3d" : "#42b84c";
+      context.beginPath();
+      context.arc(-9, -8, 20, 0, Math.PI * 2);
+      context.arc(9, -17, 24, 0, Math.PI * 2);
+      context.arc(20, 1, 18, 0, Math.PI * 2);
+      context.fill();
+      context.restore();
     }
+  }
+
+  private drawGates(context: CanvasRenderingContext2D): void {
+    this.gates.forEach((gate) => {
+      const perspective = 0.5 + clamp(gate.y / this.height, 0, 1) * 0.75;
+      const roadLeft = this.roadXAt(0, gate.y);
+      const roadRight = this.roadXAt(1, gate.y);
+      const mid = (roadLeft + roadRight) / 2;
+      this.drawGateHalf(context, roadLeft, gate.y, mid - roadLeft, gate.left, perspective);
+      this.drawGateHalf(context, mid, gate.y, roadRight - mid, gate.right, perspective);
+    });
+  }
+
+  private drawGateHalf(
+    context: CanvasRenderingContext2D,
+    x: number,
+    y: number,
+    width: number,
+    choice: GateChoice,
+    scale: number,
+  ): void {
+    const bad = choice.operation === "subtract";
+    context.fillStyle = bad ? "rgba(244, 100, 113, 0.67)" : choice.operation === "multiply" ? "rgba(245, 211, 78, 0.72)" : "rgba(99, 225, 161, 0.7)";
+    context.strokeStyle = "rgba(255,255,255,0.9)";
+    context.lineWidth = 3;
+    context.fillRect(x, y - 29 * scale, width, 58 * scale);
+    context.strokeRect(x, y - 29 * scale, width, 58 * scale);
+    context.fillStyle = "#ffffff";
+    context.strokeStyle = "rgba(45,55,65,0.45)";
+    context.lineWidth = 4;
+    context.font = `900 ${Math.round(24 * scale)}px "Arial Rounded MT Bold", sans-serif`;
+    context.textAlign = "center";
+    context.textBaseline = "middle";
+    const label = this.gateLabel(choice);
+    context.strokeText(label, x + width / 2, y);
+    context.fillText(label, x + width / 2, y);
+  }
+
+  private drawWeaponGates(context: CanvasRenderingContext2D): void {
+    this.weaponGates.forEach((gate) => {
+      const perspective = 0.5 + clamp(gate.y / this.height, 0, 1) * 0.75;
+      const roadLeft = this.roadXAt(0, gate.y);
+      const roadRight = this.roadXAt(1, gate.y);
+      const mid = (roadLeft + roadRight) / 2;
+      this.drawWeaponHalf(context, roadLeft, gate.y, mid - roadLeft, gate.left, perspective);
+      this.drawWeaponHalf(context, mid, gate.y, roadRight - mid, gate.right, perspective);
+    });
+  }
+
+  private drawWeaponHalf(
+    context: CanvasRenderingContext2D,
+    x: number,
+    y: number,
+    width: number,
+    weapon: WeaponType,
+    scale: number,
+  ): void {
+    context.fillStyle = "rgba(121, 211, 244, 0.74)";
+    context.strokeStyle = "#ffffff";
+    context.lineWidth = 3;
+    context.fillRect(x, y - 29 * scale, width, 58 * scale);
+    context.strokeRect(x, y - 29 * scale, width, 58 * scale);
+    context.fillStyle = "#ffffff";
+    context.font = `800 ${Math.max(10, Math.round(15 * scale))}px "Arial Rounded MT Bold", sans-serif`;
+    context.textAlign = "center";
+    context.textBaseline = "middle";
+    context.fillText(WEAPON_LABELS[weapon], x + width / 2, y);
+  }
+
+  private drawTarget(context: CanvasRenderingContext2D, target: Target, time: number): void {
+    if (target.dead) return;
+    const x = this.px(target.x);
+    if (target.kind === "enemy") {
+      const scale = 0.55 + clamp(target.y / this.height, 0, 1) * 0.75;
+      this.drawPerson(context, x, target.y + Math.sin(time * 7 + target.phase) * 2, "#e64f50", scale);
+      this.drawHealthBadge(context, x, target.y - 28 * scale, target.health, target.maxHealth, scale);
+      return;
+    }
+    if (target.kind === "tires") {
+      const scale = 0.55 + clamp(target.y / this.height, 0, 1) * 0.7;
+      context.save();
+      context.translate(x, target.y);
+      context.scale(scale, scale);
+      for (let index = 0; index < 3; index += 1) {
+        context.fillStyle = "#202326";
+        context.beginPath();
+        context.ellipse(0, 18 - index * 17, 36, 15, 0, 0, Math.PI * 2);
+        context.fill();
+        context.fillStyle = "#53575a";
+        context.beginPath();
+        context.ellipse(0, 14 - index * 17, 17, 7, 0, 0, Math.PI * 2);
+        context.fill();
+      }
+      context.restore();
+      this.drawHealthBadge(context, x, target.y - 46 * scale, target.health, target.maxHealth, scale);
+      return;
+    }
+    this.drawBoss(context, target, time);
+  }
+
+  private drawBoss(context: CanvasRenderingContext2D, boss: Target, time: number): void {
+    const x = this.px(boss.x);
+    const y = boss.y + Math.sin(time * 2.3) * 3;
+    const scale = Math.min(1.35, 0.95 + this.stage.stage * 0.015);
+    context.save();
+    context.translate(x, y);
+    context.scale(scale, scale);
+    context.fillStyle = "rgba(36,29,48,0.2)";
+    context.beginPath();
+    context.ellipse(0, 54, 48, 13, 0, 0, Math.PI * 2);
+    context.fill();
+    context.fillStyle = "#803ec1";
+    context.beginPath();
+    context.roundRect(-37, -26, 74, 86, 24);
+    context.fill();
+    context.fillStyle = "#a552e0";
+    context.beginPath();
+    context.arc(0, -39, 29, 0, Math.PI * 2);
+    context.fill();
+    context.fillStyle = "#6c2aa8";
+    for (let index = 0; index < 5; index += 1) {
+      context.beginPath();
+      context.moveTo(-28 + index * 14, -60);
+      context.lineTo(-22 + index * 14, -87 - (index % 2) * 8);
+      context.lineTo(-14 + index * 14, -60);
+      context.fill();
+    }
+    context.fillStyle = "#ff4f9c";
+    context.beginPath();
+    context.arc(-10, -40, 4, 0, Math.PI * 2);
+    context.arc(10, -40, 4, 0, Math.PI * 2);
+    context.fill();
     context.restore();
   }
 
-  private drawEnemy(context: CanvasRenderingContext2D, power: number, time: number): void {
-    const bob = Math.sin(time * 7) * 1.5;
-    this.drawRunner(context, -10, bob + 2, "#e45a4f", 0.85);
-    this.drawRunner(context, 10, bob - 1, "#e45a4f", 0.85);
-    context.fillStyle = "#bd322d";
+  private drawHealthBadge(
+    context: CanvasRenderingContext2D,
+    x: number,
+    y: number,
+    health: number,
+    maxHealth: number,
+    scale: number,
+  ): void {
+    const width = 46 * scale;
+    const height = 17 * scale;
+    context.fillStyle = "#222a31";
     context.beginPath();
-    context.arc(0, -35, 13, 0, Math.PI * 2);
+    context.roundRect(x - width / 2, y - height / 2, width, height, 5 * scale);
     context.fill();
     context.fillStyle = "#ffffff";
-    context.font = "800 14px 'Arial Rounded MT Bold', sans-serif";
+    context.font = `800 ${Math.max(8, 11 * scale)}px "Arial Rounded MT Bold", sans-serif`;
     context.textAlign = "center";
     context.textBaseline = "middle";
-    context.fillText(`${power}`, 0, -35);
+    context.fillText(formatCount(Math.max(0, health)), x, y);
+    if (maxHealth > 50) {
+      context.fillStyle = "#5dda6c";
+      context.fillRect(x - width / 2, y + height / 2 + 2, width * clamp(health / maxHealth, 0, 1), 3);
+    }
   }
 
-  private drawSquad(context: CanvasRenderingContext2D, time: number): void {
-    const playerY = this.height * 0.8;
-    const visible = Math.min(this.squad, 24);
-    for (let index = visible - 1; index >= 0; index -= 1) {
-      const row = Math.floor(index / 5);
-      const rowCount = Math.min(5, visible - row * 5);
-      const column = index % 5;
-      const spread = Math.min(this.laneWidth() * 0.7, 86);
+  private drawCrowd(context: CanvasRenderingContext2D, time: number): void {
+    const count = Math.min(72, Math.max(1, Math.round(10 + Math.log2(Math.max(1, this.squad)) * 6)));
+    const centerX = this.px(this.playerX);
+    const baseY = this.height * PLAYER_Y;
+    const columns = Math.min(12, Math.ceil(Math.sqrt(count * 1.6)));
+    for (let index = count - 1; index >= 0; index -= 1) {
+      const row = Math.floor(index / columns);
+      const rowCount = Math.min(columns, count - row * columns);
+      const column = index % columns;
+      const spread = Math.min(this.width * 0.34, 24 * rowCount);
       const offsetX = rowCount === 1 ? 0 : (column / (rowCount - 1) - 0.5) * spread;
-      const offsetY = row * 22 + Math.abs(offsetX) * 0.06;
-      const pulse = Math.sin(time * 5 + index * 0.7) * 1.5;
-      this.drawRunner(context, this.playerX + offsetX, playerY + offsetY + pulse, "#48aef0", row === 0 ? 1 : 0.78);
+      const offsetY = row * 17 + Math.abs(offsetX) * 0.055;
+      const bob = Math.sin(time * 8 + index * 0.8) * 1.5;
+      this.drawPerson(context, centerX + offsetX, baseY + offsetY + bob, "#2478d2", row === 0 ? 0.92 : 0.72);
     }
-
-    if (this.squad > visible) {
-      context.fillStyle = "#10120f";
-      context.strokeStyle = "#ffffff";
-      context.lineWidth = 2;
-      context.beginPath();
-      context.arc(this.playerX + 44, playerY + 54, 18, 0, Math.PI * 2);
-      context.fill();
-      context.stroke();
-      context.fillStyle = "#ffffff";
-      context.font = "800 11px ui-monospace, monospace";
-      context.textAlign = "center";
-      context.textBaseline = "middle";
-      context.fillText(`+${this.squad - visible}`, this.playerX + 44, playerY + 54);
-    }
+    const badgeY = baseY - 40;
+    context.fillStyle = "#172439";
+    context.beginPath();
+    context.roundRect(centerX - 34, badgeY - 15, 68, 30, 14);
+    context.fill();
+    context.fillStyle = "#ffffff";
+    context.font = "900 15px 'Arial Rounded MT Bold', sans-serif";
+    context.textAlign = "center";
+    context.textBaseline = "middle";
+    context.fillText(`${formatCount(this.squad)}人`, centerX, badgeY);
   }
 
-  private drawRunner(
+  private drawPerson(
     context: CanvasRenderingContext2D,
     x: number,
     y: number,
     color: string,
     scale: number,
-    neutral = false,
   ): void {
     context.save();
     context.translate(x, y);
     context.scale(scale, scale);
-    context.shadowColor = "rgba(45, 92, 40, 0.3)";
-    context.shadowBlur = 4;
-    context.fillStyle = "#f4c8a3";
+    context.fillStyle = "rgba(26,45,72,0.17)";
     context.beginPath();
-    context.arc(0, -8, 7, 0, Math.PI * 2);
+    context.ellipse(0, 16, 9, 4, 0, 0, Math.PI * 2);
     context.fill();
-    context.shadowBlur = 0;
+    context.fillStyle = "#f0c7a7";
+    context.beginPath();
+    context.arc(0, -8, 6, 0, Math.PI * 2);
+    context.fill();
     context.fillStyle = color;
     context.beginPath();
     context.roundRect(-7, -2, 14, 16, 5);
     context.fill();
-    context.strokeStyle = neutral ? "#2a76a9" : "#2b78ad";
+    context.strokeStyle = color;
     context.lineWidth = 3;
     context.lineCap = "round";
     context.beginPath();
-    context.moveTo(-4, 11);
-    context.lineTo(-7, 21);
-    context.moveTo(4, 11);
-    context.lineTo(7, 21);
+    context.moveTo(-4, 10);
+    context.lineTo(-7, 18);
+    context.moveTo(4, 10);
+    context.lineTo(7, 18);
     context.moveTo(-6, 2);
-    context.lineTo(-12, 9);
+    context.lineTo(-11, 8);
     context.moveTo(6, 2);
-    context.lineTo(12, 9);
+    context.lineTo(11, 8);
     context.stroke();
-    context.fillStyle = "#5b3828";
-    context.beginPath();
-    context.arc(0, -11, 7, Math.PI, Math.PI * 2);
-    context.fill();
     context.restore();
   }
 
-  private drawBoss(context: CanvasRenderingContext2D, time: number): void {
-    const x = this.width / 2;
-    const y = this.height * 0.18;
-    const pulse = 1 + Math.sin(time * 2.4) * 0.035;
-    context.save();
-    context.translate(x, y);
-    context.scale(pulse, pulse);
-    context.rotate(Math.sin(time * 0.8) * 0.035);
-    context.shadowColor = "rgba(85,48,29,0.35)";
-    context.shadowBlur = 18;
-    context.fillStyle = "#9e6746";
-    context.beginPath();
-    for (let index = 0; index < 8; index += 1) {
-      const angle = (index / 8) * Math.PI * 2 - Math.PI / 2;
-      const radius = index % 2 === 0 ? 72 : 48;
-      const px = Math.cos(angle) * radius;
-      const py = Math.sin(angle) * radius * 0.64;
-      if (index === 0) context.moveTo(px, py);
-      else context.lineTo(px, py);
-    }
-    context.closePath();
-    context.fill();
-    context.shadowBlur = 0;
-    context.fillStyle = "#d49a70";
-    context.beginPath();
-    context.arc(0, 0, 25, 0, Math.PI * 2);
-    context.fill();
-    context.fillStyle = "#2f211b";
-    context.beginPath();
-    context.arc(-9, -3, 3, 0, Math.PI * 2);
-    context.arc(9, -3, 3, 0, Math.PI * 2);
-    context.fill();
-    context.strokeStyle = "#2f211b";
-    context.lineWidth = 4;
-    context.beginPath();
-    context.moveTo(-11, 12);
-    context.lineTo(11, 12);
-    context.stroke();
-    context.restore();
-
-    const barWidth = Math.min(300, this.width * 0.52);
-    context.fillStyle = "rgba(0,0,0,0.7)";
-    context.fillRect(x - barWidth / 2, y + 70, barWidth, 10);
-    context.fillStyle = "#e65744";
-    context.fillRect(x - barWidth / 2 + 2, y + 72, (barWidth - 4) * (this.bossHealth / 100), 6);
-    context.fillStyle = "#5a3025";
-    context.font = "700 10px ui-monospace, monospace";
-    context.textAlign = "center";
-    context.fillText("城堡巨人", x, y + 96);
-  }
-
-  private drawBolt(context: CanvasRenderingContext2D, bolt: Bolt): void {
-    const x = this.laneXAt(bolt.lane, bolt.y);
-    const gradient = context.createLinearGradient(x, bolt.y - 45, x, bolt.y + 18);
-    gradient.addColorStop(0, "transparent");
-    gradient.addColorStop(1, "#745137");
-    context.strokeStyle = gradient;
-    context.lineWidth = 6;
-    context.shadowColor = "#5e3d29";
-    context.shadowBlur = 14;
-    context.beginPath();
-    context.moveTo(x, bolt.y - 45);
-    context.lineTo(x, bolt.y + 18);
-    context.stroke();
-    context.shadowBlur = 0;
+  private drawProjectiles(context: CanvasRenderingContext2D): void {
+    this.projectiles.forEach((projectile) => {
+      context.strokeStyle = projectile.color;
+      context.lineWidth = projectile.splash > 0 ? 6 : 3;
+      context.shadowColor = projectile.color;
+      context.shadowBlur = 8;
+      context.beginPath();
+      context.moveTo(projectile.x - projectile.vx * 0.018, projectile.y - projectile.vy * 0.018);
+      context.lineTo(projectile.x, projectile.y);
+      context.stroke();
+      context.shadowBlur = 0;
+    });
   }
 
   private drawParticles(context: CanvasRenderingContext2D): void {
@@ -805,11 +1006,80 @@ export class SwarmGame {
     context.globalAlpha = 1;
   }
 
+  private spawnCoins(x: number, y: number, count: number): void {
+    for (let index = 0; index < count; index += 1) {
+      this.coinFx.push({
+        x,
+        y,
+        startX: x + (Math.random() - 0.5) * 40,
+        startY: y + (Math.random() - 0.5) * 25,
+        life: 1,
+        delay: index * 0.045,
+      });
+    }
+  }
+
+  private updateCoinFx(delta: number): void {
+    this.coinFx.forEach((coin) => {
+      coin.delay -= delta;
+      if (coin.delay > 0) return;
+      coin.life -= delta * 1.35;
+      const progress = 1 - clamp(coin.life, 0, 1);
+      const eased = progress * progress * (3 - 2 * progress);
+      coin.x = coin.startX + (30 - coin.startX) * eased;
+      coin.y = coin.startY + (this.height - 34 - coin.startY) * eased;
+    });
+    this.coinFx = this.coinFx.filter((coin) => coin.life > 0);
+  }
+
+  private drawCoinFx(context: CanvasRenderingContext2D): void {
+    this.coinFx.forEach((coin) => {
+      if (coin.delay > 0) return;
+      context.fillStyle = "#ffd54d";
+      context.strokeStyle = "#fff0a3";
+      context.lineWidth = 2;
+      context.beginPath();
+      context.arc(coin.x, coin.y, 6, 0, Math.PI * 2);
+      context.fill();
+      context.stroke();
+    });
+  }
+
+  private drawCenterMessage(context: CanvasRenderingContext2D): void {
+    const alpha = clamp(this.messageLife * 2.2, 0, 1);
+    context.globalAlpha = alpha;
+    context.fillStyle = "#ffffff";
+    context.strokeStyle = this.messageText.includes("-") ? "#de4651" : "#238f4b";
+    context.lineWidth = 7;
+    context.font = `900 ${Math.min(54, this.width * 0.085)}px "Arial Rounded MT Bold", sans-serif`;
+    context.textAlign = "center";
+    context.textBaseline = "middle";
+    context.strokeText(this.messageText, this.width / 2, this.height * 0.59);
+    context.fillText(this.messageText, this.width / 2, this.height * 0.59);
+    context.globalAlpha = 1;
+  }
+
+  private drawRushPulse(context: CanvasRenderingContext2D): void {
+    const gradient = context.createRadialGradient(
+      this.width / 2,
+      this.height * 0.72,
+      0,
+      this.width / 2,
+      this.height * 0.72,
+      this.width * 0.72,
+    );
+    gradient.addColorStop(0, `rgba(255, 223, 81, ${this.rushPulse * 0.1})`);
+    gradient.addColorStop(0.58, "transparent");
+    gradient.addColorStop(1, `rgba(255, 255, 255, ${this.rushPulse * 0.16})`);
+    context.fillStyle = gradient;
+    context.fillRect(0, 0, this.width, this.height);
+  }
+
   private burst(x: number, y: number, color: string, count: number): void {
     for (let index = 0; index < count; index += 1) {
       const angle = Math.random() * Math.PI * 2;
-      const speed = 50 + Math.random() * 160;
-      const life = 0.35 + Math.random() * 0.45;
+      const speed = 45 + Math.random() * 150;
+      const life = 0.3 + Math.random() * 0.5;
       this.particles.push({
         x,
         y,
@@ -823,78 +1093,15 @@ export class SwarmGame {
     }
   }
 
-  private drawLabel(
-    context: CanvasRenderingContext2D,
-    text: string,
-    x: number,
-    y: number,
-    color = "#2f873f",
-  ): void {
-    context.fillStyle = color;
-    context.font = "800 14px ui-monospace, monospace";
-    context.textAlign = "center";
-    context.textBaseline = "middle";
-    context.fillText(text, x, y);
+  private px(normalizedX: number): number {
+    return this.roadXAt(normalizedX, this.height * PLAYER_Y);
   }
 
-  private laneWidth(): number {
-    return this.width * 0.22;
-  }
-
-  private laneWidthAt(y: number): number {
+  private roadXAt(normalizedX: number, y: number): number {
     const perspective = clamp(y / this.height, 0, 1);
-    return this.width * (0.115 + perspective * 0.14);
-  }
-
-  private laneX(lane: number): number {
-    return this.width * (0.28 + lane * 0.22);
-  }
-
-  private laneXAt(lane: number, y: number): number {
-    const perspective = clamp(y / this.height, 0, 1);
-    const spacing = this.width * (0.12 + perspective * 0.1);
-    return this.width / 2 + (lane - 1) * spacing;
-  }
-
-  private drawTree(context: CanvasRenderingContext2D, x: number, y: number, blossom: boolean): void {
-    const scale = 0.45 + clamp(y / this.height, 0, 1) * 0.55;
-    context.save();
-    context.translate(x, y);
-    context.scale(scale, scale);
-    context.fillStyle = "#785235";
-    context.fillRect(-6, 0, 12, 34);
-    context.fillStyle = blossom ? "#f38faf" : "#4ea44b";
-    context.beginPath();
-    context.arc(-15, 0, 22, 0, Math.PI * 2);
-    context.arc(10, -13, 27, 0, Math.PI * 2);
-    context.arc(25, 7, 20, 0, Math.PI * 2);
-    context.fill();
-    context.restore();
-  }
-
-  private drawCastle(context: CanvasRenderingContext2D, x: number, y: number): void {
-    context.save();
-    context.translate(x, y);
-    context.fillStyle = "#8b7564";
-    context.fillRect(-70, -32, 140, 64);
-    context.fillRect(-104, -60, 45, 92);
-    context.fillRect(59, -60, 45, 92);
-    context.fillStyle = "#675446";
-    context.fillRect(-18, 0, 36, 32);
-    context.fillStyle = "#ef765c";
-    context.beginPath();
-    context.moveTo(-110, -60);
-    context.lineTo(-81, -94);
-    context.lineTo(-53, -60);
-    context.moveTo(53, -60);
-    context.lineTo(81, -94);
-    context.lineTo(110, -60);
-    context.fill();
-    context.restore();
-  }
-
-  getZoneName(index: number): string {
-    return ZONES[clamp(index, 0, 2)].name;
+    const left = this.width * (0.32 - 0.285 * perspective);
+    const right = this.width * (0.68 + 0.285 * perspective);
+    return left + (right - left) * normalizedX;
   }
 
   getFormattedScore(score: number): string {

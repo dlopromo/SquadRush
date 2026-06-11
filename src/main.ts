@@ -1,111 +1,157 @@
 import "./style.css";
 import { AudioEngine } from "./audio";
-import { SwarmGame, type GameResult, type HudData } from "./game";
+import { SquadRushGame, type GameState, type HudData, type StageResult } from "./game";
+import { formatCount, migrateSave, type GameSave, type WeaponType } from "./logic";
 
-const getElement = <T extends HTMLElement>(id: string): T => {
-  const element = document.getElementById(id);
-  if (!element) throw new Error(`Missing element #${id}`);
-  return element as T;
+const element = <T extends HTMLElement>(id: string): T => {
+  const value = document.getElementById(id);
+  if (!value) throw new Error(`Missing #${id}`);
+  return value as T;
 };
 
-const canvas = getElement<HTMLCanvasElement>("game-canvas");
-const menuScreen = getElement("menu-screen");
-const pauseScreen = getElement("pause-screen");
-const resultScreen = getElement("result-screen");
-const hud = getElement("hud");
-const toast = getElement("toast");
-const startButton = getElement<HTMLButtonElement>("start-button");
-const pauseButton = getElement<HTMLButtonElement>("pause-button");
-const resumeButton = getElement<HTMLButtonElement>("resume-button");
-const restartButton = getElement<HTMLButtonElement>("restart-button");
-const soundButton = getElement<HTMLButtonElement>("sound-button");
-const squadValue = getElement("squad-value");
-const scoreValue = getElement("score-value");
-const progressFill = getElement("progress-fill");
-const zoneLabel = getElement("zone-label");
-const bestScore = getElement("best-score");
-const finalScore = getElement("final-score");
-const finalBest = getElement("final-best");
-const maxSquad = getElement("max-squad");
-const resultEyebrow = getElement("result-eyebrow");
-const resultTitle = getElement("result-title");
-const resultMessage = getElement("result-message");
-const statusIndicator = getElement("status-indicator");
+const SAVE_KEY = "squad-rush-save-v2";
+const LEGACY_BEST_KEY = "squad-rush-best";
+const legacyBest = Number.parseInt(localStorage.getItem(LEGACY_BEST_KEY) ?? "0", 10) || 0;
+let save = loadSave();
+let toastTimer = 0;
 
-const storageKey = "squad-rush-best";
-let best = Number.parseInt(localStorage.getItem(storageKey) ?? "0", 10) || 0;
-let toastTimeout = 0;
+const canvas = element<HTMLCanvasElement>("game-canvas");
+const hud = element("hud");
+const menuScreen = element("menu-screen");
+const pauseScreen = element("pause-screen");
+const clearScreen = element("clear-screen");
+const resultScreen = element("result-screen");
+const progressFill = element("progress-fill");
+const progressRunner = element("progress-runner");
+const bossBar = element("boss-bar");
+const bossFill = element("boss-fill");
+const bossLabel = element("boss-label");
+const stageValue = element("stage-value");
+const coinValue = element("coin-value");
+const comboStat = element("combo-stat");
+const comboValue = element("combo-value");
+const weaponValue = element("weapon-value");
+const weaponIcon = element("weapon-icon");
+const bestStage = element("best-stage");
+const menuCoins = element("menu-coins");
+const clearStage = element("clear-stage");
+const clearCoins = element("clear-coins");
+const upgradeMessage = element("upgrade-message");
+const finalStage = element("final-stage");
+const finalScore = element("final-score");
+const finalCoins = element("final-coins");
+const toast = element("toast");
+const startButton = element<HTMLButtonElement>("start-button");
+const pauseButton = element<HTMLButtonElement>("pause-button");
+const soundButton = element<HTMLButtonElement>("sound-button");
+const resumeButton = element<HTMLButtonElement>("resume-button");
+const restartButton = element<HTMLButtonElement>("restart-button");
 
 const audio = new AudioEngine();
-const game = new SwarmGame(canvas, audio, {
-  onStateChange: (state) => {
-    const inGame = state === "playing" || state === "paused";
-    menuScreen.classList.toggle("is-hidden", state !== "menu");
-    pauseScreen.classList.toggle("is-hidden", state !== "paused");
-    resultScreen.classList.toggle("is-hidden", state !== "won" && state !== "lost");
-    hud.classList.toggle("is-hidden", !inGame);
-    pauseButton.classList.toggle("is-active", state === "paused");
-    statusIndicator.innerHTML =
-      state === "playing"
-        ? "<i></i> 勇往直前"
-        : state === "paused"
-          ? "<i></i> 暫停中"
-          : "<i></i> 準備出發";
-  },
-  onHudUpdate: (data: HudData) => {
-    squadValue.textContent = data.squad.toString().padStart(2, "0");
-    scoreValue.textContent = game.getFormattedScore(data.score);
-    progressFill.style.transform = `scaleX(${data.progress})`;
-    zoneLabel.textContent = `0${data.zone + 1} / ${game.getZoneName(data.zone)}`;
-  },
-  onToast: (message, tone = "neutral") => {
-    window.clearTimeout(toastTimeout);
-    toast.textContent = message;
-    toast.dataset.tone = tone;
-    toast.classList.add("is-visible");
-    toastTimeout = window.setTimeout(() => toast.classList.remove("is-visible"), 1300);
-  },
-  onEnd: (result: GameResult) => {
-    best = Math.max(best, result.score);
-    localStorage.setItem(storageKey, best.toString());
-    updateBest();
-    renderResult(result);
-  },
+const game = new SquadRushGame(canvas, audio, save, {
+  onStateChange: renderState,
+  onHudUpdate: renderHud,
+  onMessage: showToast,
+  onStageEnd: renderStageResult,
+  onSave: persistSave,
 });
 
-function updateBest(): void {
-  const formatted = game.getFormattedScore(best);
-  bestScore.textContent = formatted;
-  finalBest.textContent = formatted;
-}
-
-function renderResult(result: GameResult): void {
-  finalScore.textContent = game.getFormattedScore(result.score);
-  maxSquad.textContent = result.maxSquad.toString().padStart(2, "0");
-  if (result.won) {
-    resultEyebrow.innerHTML = "<span></span> 完美勝利！";
-    resultTitle.textContent = "巨人倒下了";
-    resultMessage.textContent = "你帶領夥伴攻下城堡，成為草原上的新英雄！";
-    resultScreen.dataset.result = "won";
-  } else {
-    resultEyebrow.innerHTML = "<span></span> 差一點點！";
-    resultTitle.textContent = "挑戰失敗";
-    resultMessage.textContent = "再多招募一些夥伴，下次一定能打敗巨人！";
-    resultScreen.dataset.result = "lost";
+function loadSave(): GameSave {
+  try {
+    const raw = localStorage.getItem(SAVE_KEY);
+    return migrateSave(raw ? JSON.parse(raw) : null, legacyBest);
+  } catch {
+    return migrateSave(null, legacyBest);
   }
 }
 
-function beginGame(): void {
+function persistSave(next: GameSave): void {
+  save = next;
+  localStorage.setItem(SAVE_KEY, JSON.stringify(next));
+  renderMenuStats();
+}
+
+function renderMenuStats(): void {
+  bestStage.textContent = save.highestStage.toString();
+  menuCoins.textContent = formatCount(save.coins);
+}
+
+function renderState(state: GameState): void {
+  menuScreen.classList.toggle("is-hidden", state !== "menu");
+  pauseScreen.classList.toggle("is-hidden", state !== "paused");
+  clearScreen.classList.toggle("is-hidden", state !== "stageClear");
+  resultScreen.classList.toggle("is-hidden", state !== "lost");
+  hud.classList.toggle("is-hidden", state === "menu");
+  pauseButton.classList.toggle("is-active", state === "paused");
+}
+
+function renderHud(data: HudData): void {
+  const progress = Math.min(1, data.progress);
+  progressFill.style.transform = `scaleX(${progress})`;
+  progressRunner.style.left = `${progress * 100}%`;
+  stageValue.textContent = data.stage.toString();
+  coinValue.textContent = formatCount(data.coins);
+  comboValue.textContent = data.combo.toString();
+  comboStat.classList.toggle("is-hidden", data.combo < 2);
+  weaponValue.textContent = weaponName(data.weapon);
+  weaponIcon.dataset.weapon = data.weapon;
+
+  const showBoss = data.bossHealth !== null && data.bossMaxHealth !== null;
+  bossBar.classList.toggle("is-hidden", !showBoss);
+  if (showBoss) {
+    bossFill.style.transform = `scaleX(${Math.max(0, data.bossHealth! / data.bossMaxHealth!)})`;
+    bossLabel.textContent = `BOSS ${formatCount(data.bossHealth!)}`;
+  }
+}
+
+function weaponName(weapon: WeaponType): string {
+  if (weapon === "machineGun") return "MINIGUN";
+  if (weapon === "shotgun") return "SHOTGUN";
+  if (weapon === "rocket") return "ROCKET";
+  return "BLASTER";
+}
+
+function showToast(message: string, tone: "good" | "bad" | "weapon" = "good"): void {
+  window.clearTimeout(toastTimer);
+  toast.textContent = message;
+  toast.dataset.tone = tone;
+  toast.classList.add("is-visible");
+  toastTimer = window.setTimeout(() => toast.classList.remove("is-visible"), 900);
+}
+
+function renderStageResult(result: StageResult): void {
+  if (result.won) {
+    clearStage.textContent = result.stage.toString();
+    clearCoins.textContent = `+${formatCount(result.coinsEarned)} COINS`;
+    if (result.upgraded.length > 0) {
+      const labels = result.upgraded.map((kind) =>
+        kind === "squad" ? "START SQUAD" : kind === "damage" ? "DAMAGE" : "FIRE RATE",
+      );
+      upgradeMessage.textContent = `${labels.join(" + ")} UPGRADED!`;
+    } else {
+      upgradeMessage.textContent = `STAGE ${result.stage + 1} NEXT`;
+    }
+    return;
+  }
+  finalStage.textContent = result.stage.toString();
+  finalScore.textContent = game.getFormattedScore(result.score);
+  finalCoins.textContent = `+${formatCount(result.coinsEarned)}`;
+}
+
+function begin(): void {
   void audio.unlock();
   game.start();
 }
 
-startButton.addEventListener("click", beginGame);
-restartButton.addEventListener("click", beginGame);
+startButton.addEventListener("click", begin);
+restartButton.addEventListener("click", () => {
+  void audio.unlock();
+  game.retry();
+});
 pauseButton.addEventListener("click", () => game.togglePause());
 resumeButton.addEventListener("click", () => game.resume());
-soundButton.addEventListener("click", async () => {
-  await audio.unlock();
+soundButton.addEventListener("click", () => {
+  void audio.unlock();
   const muted = audio.toggleMute();
   soundButton.classList.toggle("is-muted", muted);
   soundButton.setAttribute("aria-label", muted ? "開啟聲音" : "關閉聲音");
@@ -115,4 +161,4 @@ document.addEventListener("visibilitychange", () => {
   if (document.hidden) game.togglePause();
 });
 
-updateBest();
+renderMenuStats();
